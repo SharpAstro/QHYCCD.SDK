@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+	<TargetFramework>net10.0</TargetFramework>
+	<RootNamespace>QHYCCD.SDK</RootNamespace>
+	<AssemblyName>QHYCCD.SDK</AssemblyName>
+	<PackageLicenseFile>license.txt</PackageLicenseFile>
+	<GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+	<DebugType>embedded</DebugType>
+	<PackageId>QHYCCD.SDK</PackageId>
+	<PackageTags>Astronomy,QHY,QHYCCD</PackageTags>
+	<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+	<RepositoryUrl>https://github.com/SharpAstro/QHYCCD.SDK</RepositoryUrl>
+	<PackageProjectUrl>https://github.com/SharpAstro/QHYCCD.SDK</PackageProjectUrl>
+	<PublishRepositoryUrl>true</PublishRepositoryUrl>
+	<EmbedUntrackedSources>true</EmbedUntrackedSources>
+	<Description>Implements accessing the QHYCCD cameras using .NET</Description>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
+	<CheckForOverflowUnderflow>False</CheckForOverflowUnderflow>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
+	<CheckForOverflowUnderflow>False</CheckForOverflowUnderflow>
+  </PropertyGroup>
+
+  <ItemGroup>
+	<None Include="license.txt" PackagePath="" Pack="True" />
+	<None Include="lib/x86/qhyccd.dll" PackagePath="runtimes/win-x86/native" Pack="True" />
+	<None Include="lib/x64/qhyccd.dll" PackagePath="runtimes/win-x64/native" Pack="True" />
+	<None Include="lib/linux-x64/libqhyccd.so" PackagePath="runtimes/linux-x64/native" Pack="True" />
+	<None Include="lib/linux-arm64/libqhyccd.so" PackagePath="runtimes/linux-arm64/native" Pack="True" />
+	<None Include="lib/osx/libqhyccd.dylib" PackagePath="runtimes/osx/native" Pack="True" />
+  </ItemGroup>
+
+  <ItemGroup>
+	<PackageReference Include="Microsoft.SourceLink.GitHub" Version="10.0.200" PrivateAssets="All" />
+	<PackageReference Include="TianWen.DAL" Version="2.0.161" />
+  </ItemGroup>
+
+</Project>
