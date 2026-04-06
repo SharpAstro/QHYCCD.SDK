@@ -3,12 +3,47 @@ using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using TianWen.DAL;
 
 namespace QHYCCD.SDK;
 
 public static partial class QHYCamera
 {
+    private static readonly Lock _sharedLock = new();
+    private static readonly Dictionary<string, SharedHandleState> _sharedHandles = [];
+    private static bool _resourceInitialized;
+
+    private class SharedHandleState
+    {
+        public IntPtr Handle;
+        public int RefCount;
+        public bool Initialized;
+    }
+
+    /// <summary>
+    /// Ensures <see cref="InitQHYCCDResource"/> has been called exactly once per process.
+    /// Must be called before <see cref="ScanQHYCCD"/> or <see cref="OpenQHYCCD"/>.
+    /// </summary>
+    public static bool EnsureResourceInitialized()
+    {
+        lock (_sharedLock)
+        {
+            if (_resourceInitialized)
+            {
+                return true;
+            }
+
+            if (InitQHYCCDResource() is QHYCCD_SUCCESS)
+            {
+                _resourceInitialized = true;
+                return true;
+            }
+
+            return false;
+        }
+    }
+
     public struct QHYCCD_CAMERA_INFO : ICMOSNativeInterface
     {
         private IntPtr _handle;
@@ -47,8 +82,27 @@ public static partial class QHYCamera
 
         public bool IsUSB3Device => _isUSB3;
 
+        /// <summary>
+        /// Opens the camera. If another <see cref="QHYCCD_CAMERA_INFO"/> for the same camera ID
+        /// is already open (e.g. a filter wheel driver sharing the camera handle), the native handle
+        /// is shared via reference counting. <see cref="CloseQHYCCD"/> is only called when the last
+        /// reference is released.
+        /// </summary>
         public bool Open()
         {
+            lock (_sharedLock)
+            {
+                if (_sharedHandles.TryGetValue(_id, out var state))
+                {
+                    // Share existing handle
+                    _handle = state.Handle;
+                    state.RefCount++;
+                    QueryCapabilities();
+                    return true;
+                }
+            }
+
+            // First open — actually call into the native SDK
             var idBytes = Encoding.ASCII.GetBytes(_id + '\0');
             unsafe
             {
@@ -59,8 +113,83 @@ public static partial class QHYCamera
             }
 
             if (_handle == IntPtr.Zero)
+            {
                 return false;
+            }
 
+            lock (_sharedLock)
+            {
+                _sharedHandles[_id] = new SharedHandleState { Handle = _handle, RefCount = 1 };
+            }
+
+            QueryCapabilities();
+            return true;
+        }
+
+        /// <summary>
+        /// Initializes the camera for single-frame mode. Calls <see cref="SetQHYCCDStreamMode"/>
+        /// and <see cref="InitQHYCCD"/>. Safe to call multiple times — only the first call per
+        /// shared handle takes effect.
+        /// </summary>
+        public bool Init()
+        {
+            lock (_sharedLock)
+            {
+                if (_sharedHandles.TryGetValue(_id, out var state) && state.Initialized)
+                {
+                    return true;
+                }
+            }
+
+            SetQHYCCDStreamMode(_handle, 0); // single frame mode
+            var result = InitQHYCCD(_handle) is QHYCCD_SUCCESS;
+            if (result)
+            {
+                lock (_sharedLock)
+                {
+                    if (_sharedHandles.TryGetValue(_id, out var state))
+                    {
+                        state.Initialized = true;
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Releases this reference to the camera handle. The native handle is only closed
+        /// when the last reference is released (reference counting for camera-cable CFW sharing).
+        /// </summary>
+        public bool Close()
+        {
+            if (_handle == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            lock (_sharedLock)
+            {
+                if (_sharedHandles.TryGetValue(_id, out var state))
+                {
+                    if (state.RefCount > 1)
+                    {
+                        state.RefCount--;
+                        _handle = IntPtr.Zero;
+                        return true;
+                    }
+
+                    _sharedHandles.Remove(_id);
+                }
+            }
+
+            var result = CloseQHYCCD(_handle) is QHYCCD_SUCCESS;
+            _handle = IntPtr.Zero;
+            return result;
+        }
+
+        private void QueryCapabilities()
+        {
             // Query chip info
             if (GetQHYCCDChipInfo(_handle, out _chipWidth, out _chipHeight, out var imgW, out var imgH, out _pixelSizeX, out _pixelSizeY, out var bpp) is QHYCCD_SUCCESS)
             {
@@ -80,23 +209,69 @@ public static partial class QHYCamera
             {
                 var bayerValue = GetQHYCCDParam(_handle, CONTROL_ID.CAM_IS_COLOR);
                 if (bayerValue >= 1 && bayerValue <= 4)
+                {
                     _bayerId = (BAYER_ID)(int)bayerValue;
+                }
             }
 
             // Check USB3
             _isUSB3 = IsQHYCCDControlAvailable(_handle, CONTROL_ID.CONTROL_SPEED) is QHYCCD_SUCCESS;
-
-            return true;
         }
 
-        public bool Close()
-        {
-            if (_handle == IntPtr.Zero)
-                return false;
+        // --- CFW (camera-cable filter wheel) methods ---
 
-            var result = CloseQHYCCD(_handle) is QHYCCD_SUCCESS;
-            _handle = IntPtr.Zero;
-            return result;
+        /// <summary>
+        /// Returns <c>true</c> if a color filter wheel is plugged into this camera's CFW port.
+        /// </summary>
+        public readonly bool IsCfwPlugged
+            => IsQHYCCDControlAvailable(_handle, CONTROL_ID.CONTROL_CFWPORT) is QHYCCD_SUCCESS
+            && IsQHYCCDCFWPlugged(_handle) is QHYCCD_SUCCESS;
+
+        /// <summary>
+        /// Gets the number of filter slots on the camera-cable CFW, or 0 if none.
+        /// </summary>
+        public readonly int CfwSlotCount
+        {
+            get
+            {
+                var slots = GetQHYCCDParam(_handle, CONTROL_ID.CONTROL_CFWSLOTSNUM);
+                return slots > 0 ? (int)slots : 0;
+            }
+        }
+
+        /// <summary>
+        /// Commands the CFW to move to the given 0-based <paramref name="position"/>.
+        /// Uses <see cref="SendOrder2QHYCCDCFW"/> with hex-digit encoding.
+        /// </summary>
+        public readonly bool SetCfwPosition(int position)
+        {
+            var order = position.ToString("X1");
+            return SendOrder2QHYCCDCFW(_handle, order, (uint)order.Length) is QHYCCD_SUCCESS;
+        }
+
+        /// <summary>
+        /// Gets the current 0-based CFW position, or -1 if the wheel is moving / status unknown.
+        /// Uses <see cref="GetQHYCCDCFWStatus"/> which returns ASCII status characters.
+        /// </summary>
+        public readonly int GetCfwPosition()
+        {
+            var status = new StringBuilder(8);
+            if (GetQHYCCDCFWStatus(_handle, status) is QHYCCD_SUCCESS && status.Length > 0)
+            {
+                var s = status.ToString();
+                // "N" = moving (CFW2/CFW3), "/" = initializing (A-series)
+                if (s is "N" or "/")
+                {
+                    return -1;
+                }
+
+                if (int.TryParse(s, System.Globalization.NumberStyles.HexNumber, null, out var pos))
+                {
+                    return pos;
+                }
+            }
+
+            return -1;
         }
 
         public int MaxWidth => _maxWidth;
