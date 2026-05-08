@@ -82,6 +82,9 @@ public static partial class QHYCamera
 
         public bool IsUSB3Device => _isUSB3;
 
+        string? INativeDeviceInfo.SensorModel =>
+            TianWen.DAL.SensorModelNames.TryGetSensorModel(Name, out var model) ? model : null;
+
         /// <summary>
         /// Opens the camera. If another <see cref="QHYCCD_CAMERA_INFO"/> for the same camera ID
         /// is already open (e.g. a filter wheel driver sharing the camera handle), the native handle
