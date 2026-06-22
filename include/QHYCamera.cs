@@ -64,6 +64,13 @@ public static partial class QHYCamera
         private bool _isTriggerCamera;
         private bool _isUSB3;
 
+        // Per-exposure state for QHY "read directly" cameras (ExpQHYCCDSingleFrame
+        // returning QHYCCD_READ_DIRECTLY). Captured in StartExposureCore and consumed
+        // by GetExposureStatus to apply QHY's October 2024 readout-timing rule.
+        private bool _readDirectly;
+        private long _exposureStartTicks;
+        private double _exposureMicros;
+
         internal QHYCCD_CAMERA_INFO(string id) : this()
         {
             _id = id;
@@ -396,27 +403,55 @@ public static partial class QHYCamera
 
         public CMOSErrorCode PulseGuideOff(GuideDirection direction) => CMOSErrorCode.Success;
 
-        public CMOSErrorCode StartLightExposure()
-        {
-            SetQHYCCDStreamMode(_handle, 0); // single frame mode
-            return ToErrorCode(ExpQHYCCDSingleFrame(_handle));
-        }
+        public CMOSErrorCode StartLightExposure() => StartExposureCore();
 
         public CMOSErrorCode StartDarkExposure()
         {
             if (_hasMechanicalShutter)
                 ControlQHYCCDShutter(_handle, 1); // close shutter
 
-            SetQHYCCDStreamMode(_handle, 0);
-            return ToErrorCode(ExpQHYCCDSingleFrame(_handle));
+            return StartExposureCore();
+        }
+
+        private CMOSErrorCode StartExposureCore()
+        {
+            SetQHYCCDStreamMode(_handle, 0); // single frame mode
+
+            // Capture the exposure length up front (it was set just before this call) so
+            // GetExposureStatus can apply the read-directly readout-timing rule below.
+            _exposureMicros = GetQHYCCDParam(_handle, CONTROL_ID.CONTROL_EXPOSURE);
+            _exposureStartTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+
+            var ret = ExpQHYCCDSingleFrame(_handle);
+
+            // QHYCCD_READ_DIRECTLY is NOT a failure: the camera reads the frame out
+            // directly rather than through a separate exposing/readout phase. Only
+            // QHYCCD_ERROR is a genuine failure -- treat everything else as a started
+            // exposure (the previous ToErrorCode() mapped READ_DIRECTLY to GeneralError,
+            // which made the downstream driver throw and such cameras unusable).
+            _readDirectly = ret == QHYCCD_READ_DIRECTLY;
+            return ret == QHYCCD_ERROR ? CMOSErrorCode.GeneralError : CMOSErrorCode.Success;
         }
 
         public CMOSErrorCode StopExposure() => ToErrorCode(CancelQHYCCDExposingAndReadout(_handle));
 
         public CMOSErrorCode GetExposureStatus(out ExposureStatus exposureStatus)
         {
+            if (_readDirectly)
+            {
+                // Read-directly cameras don't report a meaningful GetQHYCCDExposureRemaining,
+                // so gate readout on elapsed time per QHY's October 2024 guidance: read
+                // immediately for sub-3s exposures, or after 2s for longer ones. The
+                // subsequent (blocking) GetQHYCCDSingleFrame then returns the frame.
+                var elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(_exposureStartTicks);
+                exposureStatus = IsReadDirectlyFrameReady(elapsed, _exposureMicros)
+                    ? ExposureStatus.Success
+                    : ExposureStatus.Working;
+                return CMOSErrorCode.Success;
+            }
+
             var remaining = GetQHYCCDExposureRemaining(_handle);
-            if (remaining == 0 || remaining <= 100)
+            if (remaining <= ExposureRemainingDoneMicros)
             {
                 exposureStatus = ExposureStatus.Success;
             }
@@ -626,6 +661,26 @@ public static partial class QHYCamera
 
     const uint QHYCCD_SUCCESS = 0;
     const uint QHYCCD_ERROR = 0xFFFFFFFF;
+
+    // ExpQHYCCDSingleFrame returns this (rather than QHYCCD_SUCCESS) for cameras that
+    // read the frame out directly instead of via a separate exposing/readout phase.
+    // It is NOT an error. See QHYCCD_CAMERA_INFO.StartExposureCore / GetExposureStatus.
+    const uint QHYCCD_READ_DIRECTLY = 0x2001;
+
+    // GetQHYCCDExposureRemaining reports the remaining exposure time in microseconds
+    // (0xFFFFFFFF/uint.MaxValue signals an error). Within ~100us of the end the frame
+    // is effectively done, so treat that as complete rather than polling for an exact
+    // zero we may never land on.
+    const uint ExposureRemainingDoneMicros = 100;
+
+    // QHY's October 2024 read-directly readout-timing rule (mirrors PHD2 cam_qhy.cpp):
+    // GetQHYCCDSingleFrame may be called immediately for exposures under 3s; for longer
+    // exposures wait 2s first. Exposed as a pure predicate for clarity/testability.
+    const double ReadDirectlyLongExposureMicros = 3_000_000d;
+    static readonly TimeSpan ReadDirectlyLongExposureDelay = TimeSpan.FromSeconds(2);
+
+    internal static bool IsReadDirectlyFrameReady(TimeSpan elapsed, double exposureMicros)
+        => exposureMicros < ReadDirectlyLongExposureMicros || elapsed >= ReadDirectlyLongExposureDelay;
 
     const string QHYSharedLib = "qhyccd";
 
