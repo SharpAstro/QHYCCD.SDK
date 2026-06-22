@@ -2,6 +2,7 @@
 
   <PropertyGroup>
 	<TargetFramework>net10.0</TargetFramework>
+	<Nullable>enable</Nullable>
 	<RootNamespace>QHYCCD.SDK</RootNamespace>
 	<AssemblyName>QHYCCD.SDK</AssemblyName>
 	<PackageLicenseFile>license.txt</PackageLicenseFile>
