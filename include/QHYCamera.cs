@@ -52,6 +52,7 @@ public static partial class QHYCamera
         private int _maxWidth;
         private int _maxHeight;
         private int _bitDepth;
+        private int _adcBitDepth;
         private double _pixelSizeX;
         private double _pixelSizeY;
         private double _chipWidth;
@@ -143,12 +144,18 @@ public static partial class QHYCamera
         /// </summary>
         public bool Init()
         {
+            bool alreadyInitialized;
             lock (_sharedLock)
             {
-                if (_sharedHandles.TryGetValue(_id, out var state) && state.Initialized)
-                {
-                    return true;
-                }
+                alreadyInitialized = _sharedHandles.TryGetValue(_id, out var state) && state.Initialized;
+            }
+
+            if (alreadyInitialized)
+            {
+                // A handle-sharing struct (e.g. the CFW driver) skips re-init but still needs its own
+                // copy's BitDepth refined -- the native handle is live, so the control is queryable.
+                RefineAdcBitDepth();
+                return true;
             }
 
             SetQHYCCDStreamMode(_handle, 0); // single frame mode
@@ -162,9 +169,53 @@ public static partial class QHYCamera
                         state.Initialized = true;
                     }
                 }
+
+                // OutputDataActualBits is only queryable once InitQHYCCD has run.
+                RefineAdcBitDepth();
             }
 
             return result;
+        }
+
+        /// <summary>
+        /// Refines the reported <see cref="BitDepth"/> from the container/transfer width that
+        /// <see cref="GetQHYCCDChipInfo"/> reports (always 8 or 16) to the sensor's true ADC resolution
+        /// when the camera exposes it via <see cref="CONTROL_ID.OutputDataActualBits"/> -- e.g. 14 for
+        /// the QHY294. Requires <see cref="InitQHYCCD"/> to have run first (control params are only valid
+        /// post-init), so it is called from <see cref="Init"/>, not <see cref="QueryCapabilities"/>.
+        /// <para>
+        /// <b>Why this matters:</b> a 14-bit sensor's samples still travel in a 16-bit container, but the
+        /// data the SDK hands us is native (LSB-aligned) -- the consuming driver copies the delivered
+        /// 16-bit words out verbatim, it does NOT left-shift to fill the container the way N.I.N.A. does
+        /// on recording. So the true saturation point is 2^14-1 = 16383, not the container's 65535, and
+        /// the consumer derives its full-scale ADU from this value. Reporting the container width
+        /// overstated the full-scale 4x for such sensors.
+        /// </para>
+        /// <para>
+        /// <b>Alignment caveat (needs hardware verification):</b> the above assumes native LSB-aligned
+        /// delivery. QHY also exposes <see cref="CONTROL_ID.OutputDataAlignment"/>; should a camera/mode
+        /// ever be found to deliver MSB-aligned (left-shifted, container-spanning) data, its delivered
+        /// full-scale would be the container width again and this refinement would need to consult that
+        /// control. Not acted on here without hardware to confirm the numeric convention, because
+        /// guessing wrong in that direction would over-scale (clamp highlights to white) -- whereas the
+        /// current native assumption only ever under-scales, which an auto-stretch recovers. The guard
+        /// (positive and never exceeding the container width) means the worst case is a no-op that
+        /// reproduces the previous container-width behaviour.
+        /// </para>
+        /// </summary>
+        private void RefineAdcBitDepth()
+        {
+            if (_handle == IntPtr.Zero
+                || IsQHYCCDControlAvailable(_handle, CONTROL_ID.OutputDataActualBits) is not QHYCCD_SUCCESS)
+            {
+                return;
+            }
+
+            var actualBits = GetQHYCCDParam(_handle, CONTROL_ID.OutputDataActualBits);
+            if (!double.IsNaN(actualBits) && actualBits > 0 && actualBits <= _bitDepth)
+            {
+                _adcBitDepth = (int)actualBits;
+            }
         }
 
         /// <summary>
@@ -288,7 +339,16 @@ public static partial class QHYCamera
 
         public int MaxHeight => _maxHeight;
 
-        public int BitDepth => _bitDepth;
+        /// <summary>
+        /// The sensor's ADC resolution in bits when known (refined post-init from
+        /// <see cref="CONTROL_ID.OutputDataActualBits"/>, e.g. 14 for the QHY294), otherwise the
+        /// container/transfer width from <see cref="GetQHYCCDChipInfo"/> (8/16). This is the ADC
+        /// resolution the <see cref="ICMOSNativeInterface"/> contract asks for -- the value a consumer
+        /// turns into a full-scale ADU / max value -- NOT the transfer format selector (that stays on
+        /// <see cref="_bitDepth"/>, used by <see cref="GetROIFormat"/> to pick RAW8 vs RAW16). See
+        /// <see cref="RefineAdcBitDepth"/> for the native-alignment rationale.
+        /// </summary>
+        public int BitDepth => _adcBitDepth > 0 ? _adcBitDepth : _bitDepth;
 
         public double PixelSize => _pixelSizeX;
 
