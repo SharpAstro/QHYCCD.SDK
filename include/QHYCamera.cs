@@ -205,16 +205,24 @@ public static partial class QHYCamera
         /// </summary>
         private void RefineAdcBitDepth()
         {
-            if (_handle == IntPtr.Zero
-                || IsQHYCCDControlAvailable(_handle, CONTROL_ID.OutputDataActualBits) is not QHYCCD_SUCCESS)
+            // Reachable on the shared-handle path (the camera and CFW structs sharing one native
+            // handle can both hit Init()'s already-initialized branch around connect time), so the
+            // native queries are serialized under _sharedLock -- mirroring Open()'s in-lock
+            // QueryCapabilities call for the identical case. The QHY SDK makes no thread-safety
+            // promise for concurrent param queries on one handle.
+            lock (_sharedLock)
             {
-                return;
-            }
+                if (_handle == IntPtr.Zero
+                    || IsQHYCCDControlAvailable(_handle, CONTROL_ID.OutputDataActualBits) is not QHYCCD_SUCCESS)
+                {
+                    return;
+                }
 
-            var actualBits = GetQHYCCDParam(_handle, CONTROL_ID.OutputDataActualBits);
-            if (!double.IsNaN(actualBits) && actualBits > 0 && actualBits <= _bitDepth)
-            {
-                _adcBitDepth = (int)actualBits;
+                var actualBits = GetQHYCCDParam(_handle, CONTROL_ID.OutputDataActualBits);
+                if (!double.IsNaN(actualBits) && actualBits > 0 && actualBits <= _bitDepth)
+                {
+                    _adcBitDepth = (int)actualBits;
+                }
             }
         }
 
