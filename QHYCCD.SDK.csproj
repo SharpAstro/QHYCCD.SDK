@@ -35,6 +35,32 @@
 	<None Include="lib/osx/libqhyccd.dylib" PackagePath="runtimes/osx/native" Pack="True" />
   </ItemGroup>
 
+  <!--
+    The PackagePath entries above serve the NuGet package, and ONLY it. The runtimes/rid/native
+    layout is a NuGet resolution mechanism, so a consumer taking this project by ProjectReference
+    gets the managed assembly and no native library at all. Every SharpAstro consumer does exactly
+    that on a dev box, because UseLocalSiblings self-enables when the sibling clone is present, so
+    the QHY drivers found no camera there while working perfectly from the published package. That
+    is worse than the usual UseLocalSiblings trap: not a stale version but an absent capability, and
+    silent, because a missing DllImport target looks the same as no camera being plugged in.
+
+    Copying beside the consumer's binary is the fix: the app directory is where the runtime probes
+    for a DllImport, whereas a runtimes folder in an output directory is not probed without the
+    deps.json entry only a package supplies. Update rather than a second Include, so the metadata
+    lands on the item declared above instead of duplicating it.
+  -->
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
+	<None Update="lib/x64/qhyccd.dll" Link="qhyccd.dll" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Linux'))">
+	<None Update="lib/linux-x64/libqhyccd.so" Link="libqhyccd.so" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('OSX'))">
+	<None Update="lib/osx/libqhyccd.dylib" Link="libqhyccd.dylib" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
   <ItemGroup>
 	<PackageReference Include="TianWen.DAL" Version="2.0.*" />
   </ItemGroup>
