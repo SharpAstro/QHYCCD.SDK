@@ -21,7 +21,7 @@
          moment the line moves.
          The workflow now READS this back (dotnet msbuild -getProperty:VersionMajorMinor), so a
          release bump is this one line and CI cannot publish a version the package disagrees with. -->
-    <VersionMajorMinor>1.0</VersionMajorMinor>
+    <VersionMajorMinor>1.1</VersionMajorMinor>
     <!-- Local builds get Major.Minor.0; CI passes -p:Version=Major.Minor.<run><attempt>, and the
          condition lets it win. -->
     <VersionPrefix Condition="'$(VersionPrefix)' == ''">$(VersionMajorMinor).0</VersionPrefix>

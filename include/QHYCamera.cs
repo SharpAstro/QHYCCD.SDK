@@ -360,7 +360,42 @@ public static partial class QHYCamera
 
         public double PixelSize => _pixelSizeX;
 
-        public double ElectronPerADU => GetQHYCCDParam(_handle, CONTROL_ID.CONTROL_GAIN) >= 0 ? 1.0 : 0.0;
+        /// <summary>
+        /// System gain at the camera's CURRENT gain setting, from the camera's own calibration
+        /// curve. <see cref="double.NaN"/> when it cannot be obtained.
+        /// </summary>
+        /// <remarks>
+        /// <para><b>This used to return the constant 1.0.</b> The expression was
+        /// <c>GetQHYCCDParam(CONTROL_GAIN) >= 0 ? 1.0 : 0.0</c>, which reads the gain and then
+        /// discards it: every QHY frame was stamped <c>EGAIN = 1.0</c> whatever the gain, and 1.0 is
+        /// a plausible enough number that nothing downstream could tell it was invented. Anything
+        /// converting ADU to electrons (a read-noise estimate, a photometric error bar, a sensible
+        /// weight in an integration) was silently working in ADU while believing it worked in
+        /// electrons.</para>
+        /// <para>NaN is the honest failure. It means "unknown", which
+        /// <c>ImageMeta.ElectronsPerADU</c> already documents and every consumer already guards,
+        /// whereas a fabricated number cannot be distinguished from a measurement.</para>
+        /// <para><b>Unverified on hardware.</b> QHY publishes these curves in e-/ADU, which is the
+        /// unit <c>EGAIN</c> wants, but the SDK manual documents the call only as "system gain curve
+        /// value" without stating a unit, so the SCALE should be confirmed against a body with a
+        /// published gain curve before anything trusts it quantitatively.</para>
+        /// </remarks>
+        public double ElectronPerADU
+        {
+            get
+            {
+                var gain = GetQHYCCDParam(_handle, CONTROL_ID.CONTROL_GAIN);
+                if (!double.IsFinite(gain) || gain >= QHYCCD_ERROR)
+                {
+                    return double.NaN;
+                }
+
+                return QHYCCD_curveSystemGain(_handle, gain, out var systemGain) is QHYCCD_SUCCESS
+                    && double.IsFinite(systemGain) && systemGain > 0
+                    ? systemGain
+                    : double.NaN;
+            }
+        }
 
         public bool IsTriggerCamera => _isTriggerCamera;
 
@@ -434,8 +469,70 @@ public static partial class QHYCamera
             return false;
         }
 
+        /// <summary>
+        /// The QHY cooler is TWO controls, and neither of them is a switch.
+        /// </summary>
+        /// <remarks>
+        /// <para>The SDK manual is explicit: <c>CONTROL_COOLER</c> is "Set cooler target temperature"
+        /// and answers "Check if support AUTO cool mode", while <c>CONTROL_MANULPWM</c> is "Set cooler
+        /// PWM" and answers "Check if support MANUAL cool mode". There is no on/off bit anywhere.
+        /// Cooling is ENGAGED by writing a target temperature and STOPPED by writing a zero duty
+        /// cycle.</para>
+        /// <para><b>So mapping <c>CoolerOn</c> onto <c>CONTROL_COOLER</c>, as this did, turned every
+        /// on/off into a TEMPERATURE.</b> <c>SetCoolerOn(false)</c> wrote 0 to the target and
+        /// commanded a 0 C setpoint; <c>SetCoolerOn(true)</c> commanded 1 C. "Turn the cooler off" on
+        /// a QHY body therefore asked it to cool HARDER, which is the one thing the session's
+        /// end-of-night shutdown must never do to a warm sensor about to lose power. The read was the
+        /// mirror image: <c>GetCoolerOn</c> compared the target temperature against 1 and so answered
+        /// "on" only for a setpoint of exactly +1 C, which is why the shutdown step almost always
+        /// skipped silently instead.</para>
+        /// </remarks>
+        private bool IsCoolerEngaged()
+        {
+            // Auto mode is engaged when the target reads back INSIDE the control's own declared
+            // range. A body with nothing engaged reports a value outside it (a QHY178M reports -100
+            // against a declared -50 to 100), which is the only signal the SDK offers that no
+            // regulation is running; it is read as out-of-band rather than as -100 degrees so that a
+            // body using a different sentinel still behaves.
+            var target = GetQHYCCDParam(_handle, CONTROL_ID.CONTROL_COOLER);
+            if (double.IsFinite(target) && target < QHYCCD_ERROR
+                && GetQHYCCDParamMinMaxStep(_handle, CONTROL_ID.CONTROL_COOLER, out var min, out var max, out _) is QHYCCD_SUCCESS
+                && target >= min && target <= max)
+            {
+                return true;
+            }
+
+            // Manual mode: any non-zero duty cycle is the TEC actually running.
+            var pwm = GetQHYCCDParam(_handle, CONTROL_ID.CONTROL_CURPWM);
+            return double.IsFinite(pwm) && pwm < QHYCCD_ERROR && pwm > 0;
+        }
+
         public CMOSErrorCode SetControlValue(CMOSControlType controlType, int value, bool isAuto = false)
         {
+            if (controlType is CMOSControlType.CoolerOn)
+            {
+                // OFF is unambiguous: manual mode at zero duty, which is the SDK's only way to stop
+                // the TEC. ON has no command of its own, so rather than inventing a setpoint (the
+                // fabrication that made the old mapping dangerous) it RESUMES the target already in
+                // the control, and refuses when there is none to resume. Callers set the target
+                // first in any case: ICameraDriver.CoolToSetpointAsync writes the setpoint and only
+                // then turns the cooler on.
+                if (value == 0)
+                {
+                    return ToErrorCode(SetQHYCCDParam(_handle, CONTROL_ID.CONTROL_MANULPWM, 0));
+                }
+
+                var target = GetQHYCCDParam(_handle, CONTROL_ID.CONTROL_COOLER);
+                if (double.IsFinite(target) && target < QHYCCD_ERROR
+                    && GetQHYCCDParamMinMaxStep(_handle, CONTROL_ID.CONTROL_COOLER, out var min, out var max, out _) is QHYCCD_SUCCESS
+                    && target >= min && target <= max)
+                {
+                    return ToErrorCode(SetQHYCCDParam(_handle, CONTROL_ID.CONTROL_COOLER, target));
+                }
+
+                return CMOSErrorCode.GeneralError;
+            }
+
             if (DALControlTypeToQHY(controlType, out var qhyControl))
                 return ToErrorCode(SetQHYCCDParam(_handle, qhyControl, value));
 
@@ -445,9 +542,58 @@ public static partial class QHYCamera
         public CMOSErrorCode GetControlValue(CMOSControlType controlType, out int value, out bool isAuto)
         {
             isAuto = false;
+            if (controlType is CMOSControlType.CoolerOn)
+            {
+                value = IsCoolerEngaged() ? 1 : 0;
+                return CMOSErrorCode.Success;
+            }
+
+            if (controlType is CMOSControlType.TargetTemperature)
+            {
+                // CONTROL_COOLER reports an OUT-OF-BAND value when no setpoint is engaged (a QHY178M
+                // answers -100 against a declared range of -50 to 100), and -100 is a plausible
+                // sensor temperature, so passing it through is how "nothing is engaged" became a
+                // measurement. It reached SET-TEMP in the header of every frame captured with the
+                // cooler idle, and the cooling ramp read it as a target it was already far past.
+                // Reported as a refusal instead, which the callers already turn into "unknown".
+                var target = GetQHYCCDParam(_handle, CONTROL_ID.CONTROL_COOLER);
+                if (double.IsFinite(target) && target < QHYCCD_ERROR
+                    && GetQHYCCDParamMinMaxStep(_handle, CONTROL_ID.CONTROL_COOLER, out var min, out var max, out _) is QHYCCD_SUCCESS
+                    && target >= min && target <= max)
+                {
+                    value = (int)target;
+                    return CMOSErrorCode.Success;
+                }
+
+                value = 0;
+                return CMOSErrorCode.GeneralError;
+            }
+
             if (DALControlTypeToQHY(controlType, out var qhyControl))
             {
                 var result = GetQHYCCDParam(_handle, qhyControl);
+
+                // GetQHYCCDParam signals failure by RETURNING the error sentinel as the value, so
+                // there is no separate status to check and an unguarded read cannot tell a reading
+                // from a refusal. This used to cast straight to int and answer Success: a failed
+                // read became a garbage number the caller had every reason to trust, because a
+                // double to int conversion of 4294967295 is out of range and lands wherever the
+                // hardware puts it. Measured on a QHY178M, where nine of its twenty-seven available
+                // controls answer this way, all of them set-only mode flags (the bin modes, the bit
+                // depths, single-frame against live video), which are available to SET and
+                // meaningless to READ.
+                //
+                // The range check is not belt-and-braces either: CONTROL_EXPOSURE is in microseconds
+                // with a maximum of 3.6e9 on this body, so an exposure over about 35.8 minutes
+                // exceeds int and would wrap. It is reported as a refusal rather than silently
+                // truncated; widening the value to long would change the DAL interface and is a
+                // separate decision.
+                if (!double.IsFinite(result) || result >= QHYCCD_ERROR || result is > int.MaxValue or < int.MinValue)
+                {
+                    value = 0;
+                    return CMOSErrorCode.GeneralError;
+                }
+
                 value = (int)result;
                 return CMOSErrorCode.Success;
             }
@@ -455,9 +601,11 @@ public static partial class QHYCamera
             throw new ArgumentException($"{controlType} is not supported", nameof(controlType));
         }
 
-        public CMOSErrorCode PulseGuideOn(GuideDirection direction)
-        {
-            uint qhyDir = direction switch
+        /// <summary>
+        /// QHY's ST-4 direction codes: 0 EAST (RA+), 1 NORTH (Dec+), 2 SOUTH (Dec-), 3 WEST (RA-).
+        /// </summary>
+        private static uint ToQhyGuideDirection(GuideDirection direction)
+            => direction switch
             {
                 GuideDirection.North => 1,
                 GuideDirection.South => 2,
@@ -466,9 +614,55 @@ public static partial class QHYCamera
                 _ => throw new ArgumentException($"Unknown guide direction: {direction}", nameof(direction))
             };
 
-            return ToErrorCode(ControlQHYCCDGuide(_handle, qhyDir, 50000));
+        /// <summary>
+        /// The camera times its own pulse: <c>ControlQHYCCDGuide</c> takes the duration.
+        /// </summary>
+        public bool CanPulseGuideForDuration => true;
+
+        /// <inheritdoc/>
+        /// <remarks>
+        /// <c>ControlQHYCCDGuide</c>'s duration is in MILLISECONDS and the parameter is a
+        /// <see cref="ushort"/>, so the longest pulse this hardware can be asked for is 65.535
+        /// seconds. A guide correction is milliseconds to a few seconds, so the clamp is a guard
+        /// against a nonsense argument rather than a real limit; it saturates instead of wrapping,
+        /// because a wrapped duration would silently become a SHORT pulse in the right direction and
+        /// look like a working guider that never corrects.
+        /// </remarks>
+        public CMOSErrorCode PulseGuideOn(GuideDirection direction, TimeSpan duration)
+        {
+            var milliseconds = duration.TotalMilliseconds;
+            if (!double.IsFinite(milliseconds) || milliseconds < 0)
+            {
+                return CMOSErrorCode.GeneralError;
+            }
+
+            var clamped = (ushort)Math.Min(milliseconds, ushort.MaxValue);
+            return ToErrorCode(ControlQHYCCDGuide(_handle, ToQhyGuideDirection(direction), clamped));
         }
 
+        /// <summary>
+        /// The untimed legacy form, superseded by <see cref="PulseGuideOn(GuideDirection, TimeSpan)"/>.
+        /// </summary>
+        /// <remarks>
+        /// <b>There is no way to start an st-4 pulse on this hardware without stating how long it
+        /// runs</b>, so this asks for the longest one it can express and relies on the caller to stop
+        /// it, which is what it has always done (it passed 50000, a 50 SECOND pulse, while the caller
+        /// believed it was asking for milliseconds). Any consumer that checks
+        /// <see cref="CanPulseGuideForDuration"/> takes the timed overload and never reaches this.
+        /// </remarks>
+        public CMOSErrorCode PulseGuideOn(GuideDirection direction)
+            => ToErrorCode(ControlQHYCCDGuide(_handle, ToQhyGuideDirection(direction), ushort.MaxValue));
+
+        /// <summary>
+        /// Cannot stop a pulse: the SDK exposes no cancel, and the camera runs the duration it was
+        /// given.
+        /// </summary>
+        /// <remarks>
+        /// Reporting success here is the honest answer only because <see cref="CanPulseGuideForDuration"/>
+        /// is true, so a caller states the duration up front and never needs this to end a pulse. It
+        /// was NOT honest before: the duration was a hardcoded constant, this was the only thing that
+        /// could have ended it, and it did nothing while saying it had worked.
+        /// </remarks>
         public CMOSErrorCode PulseGuideOff(GuideDirection direction) => CMOSErrorCode.Success;
 
         public CMOSErrorCode StartLightExposure() => StartExposureCore();
@@ -586,6 +780,42 @@ public static partial class QHYCamera
             return ToErrorCode(GetQHYCCDSingleFrame(_handle, out _, out _, out _, out _, buffer));
         }
 
+        public bool TryGetEffectiveArea(out int startX, out int startY, out int width, out int height)
+            => TryGetArea(GetQHYCCDEffectiveArea(_handle, out var x, out var y, out var w, out var h), x, y, w, h,
+                out startX, out startY, out width, out height);
+
+        public bool TryGetOverscanArea(out int startX, out int startY, out int width, out int height)
+            => TryGetArea(GetQHYCCDOverScanArea(_handle, out var x, out var y, out var w, out var h), x, y, w, h,
+                out startX, out startY, out width, out height);
+
+        /// <summary>
+        /// Shared guard for the two area queries: a SUCCESS carrying a zero or oversized extent is
+        /// not an area, and is reported as "declares none" rather than passed on.
+        /// </summary>
+        /// <remarks>
+        /// A QHY178M answers SUCCESS for both while reporting an effective area equal to the whole
+        /// readout and an overscan of 0 x 0, so an empty rectangle is a NORMAL answer from a body
+        /// with no shielded margin and must not reach a caller as a degenerate section. The int cast
+        /// is guarded for the same reason the control read is: these are uint out-parameters, and a
+        /// firmware that fills them with a sentinel would otherwise become a negative rectangle.
+        /// </remarks>
+        private static bool TryGetArea(uint result, uint x, uint y, uint w, uint h,
+            out int startX, out int startY, out int width, out int height)
+        {
+            startX = startY = width = height = 0;
+            if (result is not QHYCCD_SUCCESS || w is 0 || h is 0
+                || x > int.MaxValue || y > int.MaxValue || w > int.MaxValue || h > int.MaxValue)
+            {
+                return false;
+            }
+
+            startX = (int)x;
+            startY = (int)y;
+            width = (int)w;
+            height = (int)h;
+            return true;
+        }
+
         private static string GetModelFromId(string id)
         {
             // QHY camera IDs are in the format "MODEL-SERIAL", e.g. "QHY600M-abc123"
@@ -615,7 +845,10 @@ public static partial class QHYCamera
             CMOSControlType.HighSpeedMode => CONTROL_ID.CONTROL_SPEED,
             CMOSControlType.CoolerPowerPercent => CONTROL_ID.CONTROL_CURPWM,
             CMOSControlType.TargetTemperature => CONTROL_ID.CONTROL_COOLER,
-            CMOSControlType.CoolerOn => CONTROL_ID.CONTROL_COOLER,
+            // CoolerOn is deliberately NOT in this table: QHYCamera.SetControlValue and
+            // GetControlValue handle it directly, because QHY has no on/off bit and routing it
+            // through here is what made "turn the cooler off" command a 0 C setpoint.
+            CMOSControlType.CoolerOn => (CONTROL_ID)int.MaxValue,
             CMOSControlType.MonoBin => (CONTROL_ID)int.MaxValue,
             CMOSControlType.FanOn => (CONTROL_ID)int.MaxValue,
             CMOSControlType.PatternAdjust => (CONTROL_ID)int.MaxValue,
@@ -815,6 +1048,14 @@ public static partial class QHYCamera
     [LibraryImport(QHYSharedLib, EntryPoint = "GetQHYCCDParamMinMaxStep")]
     [UnmanagedCallConv(CallConvs = [typeof(CallConvStdcall)])]
     public static partial uint GetQHYCCDParamMinMaxStep(IntPtr handle, CONTROL_ID controlId, out double min, out double max, out double step);
+
+    /// <summary>
+    /// The system gain the camera's own calibration curve gives for a SDK gain value, which is what
+    /// <see cref="QHYCamera.ElectronPerADU"/> reports.
+    /// </summary>
+    [LibraryImport(QHYSharedLib, EntryPoint = "QHYCCD_curveSystemGain")]
+    [UnmanagedCallConv(CallConvs = [typeof(CallConvStdcall)])]
+    public static partial uint QHYCCD_curveSystemGain(IntPtr handle, double gainV, out double systemGain);
 
     // --- Chip Info ---
 
