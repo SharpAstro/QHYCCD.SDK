@@ -61,7 +61,24 @@
 	<None Update="lib/osx/libqhyccd.dylib" Link="libqhyccd.dylib" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
-  <ItemGroup>
+  <!--
+    Take TianWen.DAL from the sibling checkout when there is one, exactly as tianwen does, and
+    self-enable on Exists() so no switch has to be passed.
+
+    This is not a convenience. With an unconditional PackageReference here, a consumer building
+    BOTH this project and TianWen.DAL from source still pulled the PUBLISHED DAL in through this
+    reference, so two assemblies with the same simple name reached the compiler and it refused
+    them outright (CS1704). Raising the sibling's version only wins until CI publishes the next
+    patch of that same minor, which is exactly what happened: 2.1.241 went out, the sibling built
+    as 2.1.0, and 2.1.251 then took the lead back. There is no version to pick that stays ahead,
+    so the reference itself has to go away when the source is present.
+
+    A build with no sibling, CI included, is unaffected and still restores the package.
+  -->
+  <ItemGroup Condition="Exists('$(MSBuildThisFileDirectory)..\TianWen.DAL\TianWen.DAL.csproj')">
+	<ProjectReference Include="..\TianWen.DAL\TianWen.DAL.csproj" />
+  </ItemGroup>
+  <ItemGroup Condition="!Exists('$(MSBuildThisFileDirectory)..\TianWen.DAL\TianWen.DAL.csproj')">
 	<PackageReference Include="TianWen.DAL" Version="2.1.*" />
   </ItemGroup>
 
