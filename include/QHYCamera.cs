@@ -727,8 +727,12 @@ public static partial class QHYCamera
         BAYER_RG
     }
 
-    const uint QHYCCD_SUCCESS = 0;
-    const uint QHYCCD_ERROR = 0xFFFFFFFF;
+    // Public because every P/Invoke on this class returns one of these, so a caller outside it
+    // cannot read its own result without them. They were private, which left a consumer either
+    // comparing against a bare 0 or redeclaring the success code beside its own call site, and a
+    // duplicated constant is exactly the kind that drifts from the one it was copied from.
+    public const uint QHYCCD_SUCCESS = 0;
+    public const uint QHYCCD_ERROR = 0xFFFFFFFF;
 
     // ExpQHYCCDSingleFrame returns this (rather than QHYCCD_SUCCESS) for cameras that
     // read the frame out directly instead of via a separate exposing/readout phase.
