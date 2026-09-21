@@ -48,17 +48,43 @@
     for a DllImport, whereas a runtimes folder in an output directory is not probed without the
     deps.json entry only a package supplies. Update rather than a second Include, so the metadata
     lands on the item declared above instead of duplicating it.
+
+    Selected by RID, where this used to test the OS alone and pick x64 unconditionally. On an
+    arm64 Linux box that copied lib/linux-x64/libqhyccd.so, which is WORSE than copying nothing: a
+    wrong-architecture native fails to load with an error about the file rather than an obvious
+    absence, so it reads as a corrupt library instead of an unsupported one. linux-arm64 is not a
+    hypothetical target here either, being the headless Raspberry Pi path, and the correct .so was
+    sitting in lib/linux-arm64 the whole time, packaged and never copied. The same went for a
+    win-x86 build, which got the x64 DLL.
+
+    QHY ships no linux-arm (32-bit) and no win-arm64 binary, so those RIDs map to nothing and
+    nothing is copied, which is the honest answer rather than an oversight. macOS has one directory
+    rather than a per-architecture pair, matching its single runtimes/osx/native package path, so
+    both osx-x64 and osx-arm64 resolve to it.
+
+    ZWOptical.SDK carries the same RID mapping, arrived at independently because its layout forced
+    it: there lib/x64 holds BOTH the Windows .dll and the Linux .so. The two repos differ in their
+    directory names, so the mappings cannot be shared, only kept in the same shape.
   -->
-  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
-	<None Update="lib/x64/qhyccd.dll" Link="qhyccd.dll" CopyToOutputDirectory="PreserveNewest" />
-  </ItemGroup>
+  <PropertyGroup>
+	<_QhyNativeRid Condition="'$(RuntimeIdentifier)' != ''">$(RuntimeIdentifier)</_QhyNativeRid>
+	<_QhyNativeRid Condition="'$(_QhyNativeRid)' == ''">$(NETCoreSdkPortableRuntimeIdentifier)</_QhyNativeRid>
+	<!-- Never empty past here, so the StartsWith calls below always have a string to run on. -->
+	<_QhyNativeRid Condition="'$(_QhyNativeRid)' == ''">unknown</_QhyNativeRid>
 
-  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Linux'))">
-	<None Update="lib/linux-x64/libqhyccd.so" Link="libqhyccd.so" CopyToOutputDirectory="PreserveNewest" />
-  </ItemGroup>
+	<_QhyNativeDir Condition="'$(_QhyNativeRid)' == 'win-x64'">lib/x64</_QhyNativeDir>
+	<_QhyNativeDir Condition="'$(_QhyNativeRid)' == 'win-x86'">lib/x86</_QhyNativeDir>
+	<_QhyNativeDir Condition="'$(_QhyNativeRid)' == 'linux-x64'">lib/linux-x64</_QhyNativeDir>
+	<_QhyNativeDir Condition="'$(_QhyNativeRid)' == 'linux-arm64'">lib/linux-arm64</_QhyNativeDir>
+	<_QhyNativeDir Condition="$(_QhyNativeRid.StartsWith('osx-'))">lib/osx</_QhyNativeDir>
 
-  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('OSX'))">
-	<None Update="lib/osx/libqhyccd.dylib" Link="libqhyccd.dylib" CopyToOutputDirectory="PreserveNewest" />
+	<_QhyNativeFile Condition="$(_QhyNativeRid.StartsWith('win-'))">qhyccd.dll</_QhyNativeFile>
+	<_QhyNativeFile Condition="$(_QhyNativeRid.StartsWith('linux-'))">libqhyccd.so</_QhyNativeFile>
+	<_QhyNativeFile Condition="$(_QhyNativeRid.StartsWith('osx-'))">libqhyccd.dylib</_QhyNativeFile>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(_QhyNativeDir)' != ''">
+	<None Update="$(_QhyNativeDir)/$(_QhyNativeFile)" Link="$(_QhyNativeFile)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <!--

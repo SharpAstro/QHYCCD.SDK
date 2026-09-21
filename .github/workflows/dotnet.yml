@@ -62,6 +62,25 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     needs: build
+    # Gated, because it was not, and this workflow triggers on pull_request as well as push: with no
+    # condition here every PR run reached the push step and published a real package from an
+    # unmerged branch. That is not hypothetical. ZWOptical.SDK carried the identical gap and it
+    # fired there on 2026-09-21, putting 4.3.691 on nuget.org from a PR branch with the job log
+    # saying so plainly; this repo was the other half of the same omission, found in the same sweep,
+    # and is fixed before it can happen here rather than after.
+    #
+    # It is not recoverable the way a bad commit is, since nuget.org allows unlisting but never
+    # deletion, and the version number is spent either way. The sharper problem is not the wasted
+    # number: an unreviewed branch, from anyone able to open a PR, is what reaches the feed.
+    #
+    # This is the condition the org pattern doc prescribes (.github/docs/dotnet-ci-pattern.md,
+    # "publish-nuget") and the one tianwen's own workflow already carries. Both halves are load
+    # bearing: the event test alone would still let a push to another branch publish, and the ref
+    # test alone would still let a PR TARGETING main publish, which is the case that actually fired,
+    # because github.ref on a pull_request run names the merge ref rather than the source branch.
+    #
+    # The fix is self-demonstrating: on a PR this job now reports as skipped rather than passing.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
     steps:
     - name: Download NuGet packages
