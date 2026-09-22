@@ -450,6 +450,35 @@ public static partial class QHYCamera
             }
             : BayerPattern.Monochrome;
 
+        /// <summary>
+        /// True on a colour body: QHY exposes <c>CONTROL_WBG</c> alongside R and B, so a caller
+        /// setting a balance has three channels to write.
+        /// </summary>
+        public bool HasThreeChannelWhiteBalance => _isColor;
+
+        /// <summary>
+        /// Not answered for QHY, deliberately.
+        /// </summary>
+        /// <remarks>
+        /// <para>The BOUNDS are readable (<c>GetQHYCCDParamMinMaxStep</c> on <c>CONTROL_WBR</c>),
+        /// but the member's whole purpose is the NEUTRAL, and that has not been measured on a QHY
+        /// body. It cannot be measured here either: every QHY camera in this collection is mono
+        /// (178M, 183M), and a mono body has no white balance to calibrate against.</para>
+        /// <para>Returning a guessed neutral would be worse than returning nothing. The DAL's
+        /// contract warns that a vendor's DEFAULT is a third thing again, typically a pleasant
+        /// daylight balance rather than unity, so reading the default and calling it neutral is
+        /// precisely the mistake this interface exists to stop. False keeps the caller on its
+        /// documented fallback, which is what QHY bodies already got.</para>
+        /// <para>To close this: capture two frames on a colour QHY at two different WB_R values and
+        /// compare the per-photosite quantisation step, exactly as was done for ZWO (65 measured
+        /// 1.312 = 65/50) and Player One (0 measured 1.000).</para>
+        /// </remarks>
+        public bool TryGetWhiteBalanceRange(out int min, out int max, out int neutral)
+        {
+            min = max = neutral = 0;
+            return false;
+        }
+
         public bool TryGetControlRange(CMOSControlType ctrlType, out int min, out int max)
         {
             min = max = 0;
@@ -832,6 +861,9 @@ public static partial class QHYCamera
             CMOSControlType.Exposure => CONTROL_ID.CONTROL_EXPOSURE,
             CMOSControlType.Gamma => CONTROL_ID.CONTROL_GAMMA,
             CMOSControlType.WB_R => CONTROL_ID.CONTROL_WBR,
+            // Green exists on QHY and had no DAL control to map to before 3.0, so writing a
+            // balance left it wherever it was last put.
+            CMOSControlType.WB_G => CONTROL_ID.CONTROL_WBG,
             CMOSControlType.WB_B => CONTROL_ID.CONTROL_WBB,
             CMOSControlType.Brightness => CONTROL_ID.CONTROL_BRIGHTNESS,
             CMOSControlType.BandwidthOverload => CONTROL_ID.CONTROL_USBTRAFFIC,
