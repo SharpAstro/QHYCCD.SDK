@@ -565,7 +565,10 @@ public static partial class QHYCamera
             if (DALControlTypeToQHY(controlType, out var qhyControl))
                 return ToErrorCode(SetQHYCCDParam(_handle, qhyControl, value));
 
-            throw new ArgumentException($"{controlType} is not supported", nameof(controlType));
+            // A control with no QHY equivalent is refused, never thrown. A consumer writes one list of
+            // controls to every vendor and each maps a different subset: this threw for Flip, the first
+            // control TianWen's connect writes, so no QHY camera could connect through it.
+            return CMOSErrorCode.InvalidControlType;
         }
 
         public CMOSErrorCode GetControlValue(CMOSControlType controlType, out int value, out bool isAuto)
@@ -627,7 +630,9 @@ public static partial class QHYCamera
                 return CMOSErrorCode.Success;
             }
 
-            throw new ArgumentException($"{controlType} is not supported", nameof(controlType));
+            // Refused as SetControlValue refuses it.
+            value = 0;
+            return CMOSErrorCode.InvalidControlType;
         }
 
         /// <summary>
