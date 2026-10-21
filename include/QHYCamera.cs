@@ -536,6 +536,9 @@ public static partial class QHYCamera
             return double.IsFinite(pwm) && pwm < QHYCCD_ERROR && pwm > 0;
         }
 
+        /// <summary>The TEC duty at full drive, the top of <c>CONTROL_CURPWM</c> and <c>CONTROL_MANULPWM</c>.</summary>
+        private const double MaxPwm = 255;
+
         public CMOSErrorCode SetControlValue(CMOSControlType controlType, int value, bool isAuto = false)
         {
             if (controlType is CMOSControlType.CoolerOn)
@@ -626,7 +629,17 @@ public static partial class QHYCamera
                     return CMOSErrorCode.GeneralError;
                 }
 
-                value = (int)result;
+                value = controlType switch
+                {
+                    // The DAL carries the sensor in TENTHS of a degree; CONTROL_CURTEMP is whole degrees with
+                    // a half-degree step (19.0 on a QHY178M at room temperature), so passed through it read as
+                    // 1.9 C everywhere a consumer takes TemperatureDeci at its word.
+                    CMOSControlType.TemperatureDeci => (int)Math.Round(result * 10),
+                    // The DAL carries the cooler in PERCENT; CONTROL_CURPWM is the TEC's duty in 0 to 255, so a
+                    // cooler at full drive read as 255 %.
+                    CMOSControlType.CoolerPowerPercent => (int)Math.Round(result * 100 / MaxPwm),
+                    _ => (int)result,
+                };
                 return CMOSErrorCode.Success;
             }
 
@@ -709,8 +722,39 @@ public static partial class QHYCamera
             return StartExposureCore();
         }
 
+        /// <summary>
+        /// True once this camera's handle is open AND <see cref="Init"/> has run on it (by this copy or one sharing the
+        /// handle).
+        /// </summary>
+        /// <remarks>
+        /// <b>An exposure on a handle that was opened but never initialised does not fail, it FAULTS</b>: on a QHY178M
+        /// (SDK v25.9.29, 2026-10-22) <c>ExpQHYCCDSingleFrame</c> raised an access violation inside the native library,
+        /// which no .NET handler can catch and which ends the whole process, with the camera's cooler left as it was. So
+        /// the frame calls ask this first and refuse instead.
+        /// </remarks>
+        public bool IsInitialized
+        {
+            get
+            {
+                if (_handle == IntPtr.Zero)
+                {
+                    return false;
+                }
+
+                lock (_sharedLock)
+                {
+                    return _sharedHandles.TryGetValue(_id, out var state) && state.Handle == _handle && state.Initialized;
+                }
+            }
+        }
+
         private CMOSErrorCode StartExposureCore()
         {
+            if (!IsInitialized)
+            {
+                return _handle == IntPtr.Zero ? CMOSErrorCode.CameraClosed : CMOSErrorCode.InvalidSequence;
+            }
+
             SetQHYCCDStreamMode(_handle, 0); // single frame mode
 
             // Capture the exposure length up front (it was set just before this call) so
@@ -811,6 +855,12 @@ public static partial class QHYCamera
 
         public CMOSErrorCode GetDataAfterExposure(IntPtr buffer, int bufferSize)
         {
+            // Refused rather than faulting, as StartExposureCore is (see IsInitialized).
+            if (!IsInitialized)
+            {
+                return _handle == IntPtr.Zero ? CMOSErrorCode.CameraClosed : CMOSErrorCode.InvalidSequence;
+            }
+
             return ToErrorCode(GetQHYCCDSingleFrame(_handle, out _, out _, out _, out _, buffer));
         }
 
