@@ -19,6 +19,13 @@ public static partial class QHYCamera
         public IntPtr Handle;
         public int RefCount;
         public bool Initialized;
+
+        /// <summary>
+        /// Where a frame is downloaded first, <see cref="ScratchBytes"/> long (<c>GetQHYCCDMemLength</c>, the most the SDK
+        /// says it writes): <c>GetQHYCCDSingleFrame</c> takes no size, so it never writes into a caller's buffer.
+        /// </summary>
+        public IntPtr Scratch;
+        public int ScratchBytes;
     }
 
     /// <summary>
@@ -101,6 +108,10 @@ public static partial class QHYCamera
         /// </summary>
         public bool Open()
         {
+            // One lock across the look-up, OpenQHYCCD and the insert (TianWen #1759): split, two opens at once (a discovery
+            // racing a camera or wheel connect) both opened the camera, the second set the count back to 1, and the first
+            // close freed a handle the other still held. Held across a native open, which is rare and short, rather than a
+            // lock-free hand-off, because the SDK makes no promise for two opens of one camera at once.
             lock (_sharedLock)
             {
                 if (_sharedHandles.TryGetValue(_id, out var state))
@@ -111,30 +122,26 @@ public static partial class QHYCamera
                     QueryCapabilities();
                     return true;
                 }
-            }
 
-            // First open — actually call into the native SDK
-            var idBytes = Encoding.ASCII.GetBytes(_id + '\0');
-            unsafe
-            {
-                fixed (byte* pId = idBytes)
+                // First open: actually call into the native SDK
+                var idBytes = Encoding.ASCII.GetBytes(_id + '\0');
+                unsafe
                 {
-                    _handle = OpenQHYCCD((IntPtr)pId);
+                    fixed (byte* pId = idBytes)
+                    {
+                        _handle = OpenQHYCCD((IntPtr)pId);
+                    }
                 }
-            }
 
-            if (_handle == IntPtr.Zero)
-            {
-                return false;
-            }
+                if (_handle == IntPtr.Zero)
+                {
+                    return false;
+                }
 
-            lock (_sharedLock)
-            {
                 _sharedHandles[_id] = new SharedHandleState { Handle = _handle, RefCount = 1 };
+                QueryCapabilities();
+                return true;
             }
-
-            QueryCapabilities();
-            return true;
         }
 
         /// <summary>
@@ -158,18 +165,34 @@ public static partial class QHYCamera
                 return true;
             }
 
-            SetQHYCCDStreamMode(_handle, 0); // single frame mode
-            var result = InitQHYCCD(_handle) is QHYCCD_SUCCESS;
-            if (result)
+            bool result;
+            // One lock across the check and InitQHYCCD (TianWen #1759): the camera and its cable wheel share a handle, and
+            // two copies initialising it at once both ran InitQHYCCD on it.
+            lock (_sharedLock)
             {
-                lock (_sharedLock)
+                if (_sharedHandles.TryGetValue(_id, out var shared) && shared.Initialized)
                 {
-                    if (_sharedHandles.TryGetValue(_id, out var state))
+                    result = true;
+                }
+                else
+                {
+                    SetQHYCCDStreamMode(_handle, 0); // single frame mode
+                    result = InitQHYCCD(_handle) is QHYCCD_SUCCESS;
+                    if (result && shared is not null)
                     {
-                        state.Initialized = true;
+                        shared.Initialized = true;
+                    }
+
+                    // The DAL carries RAW Bayer data: a colour body is told never to debayer, whatever it was left at.
+                    if (result && _isColor)
+                    {
+                        _ = SetQHYCCDDebayerOnOff(_handle, false);
                     }
                 }
+            }
 
+            if (result)
+            {
                 // OutputDataActualBits is only queryable once InitQHYCCD has run.
                 RefineAdcBitDepth();
             }
@@ -249,6 +272,11 @@ public static partial class QHYCamera
                     }
 
                     _sharedHandles.Remove(_id);
+                    if (state.Scratch != IntPtr.Zero)
+                    {
+                        Marshal.FreeHGlobal(state.Scratch);
+                        state.Scratch = IntPtr.Zero;
+                    }
                 }
             }
 
@@ -292,8 +320,10 @@ public static partial class QHYCamera
         /// <summary>
         /// Returns <c>true</c> if a color filter wheel is plugged into this camera's CFW port.
         /// </summary>
+        /// <remarks>False, asking nothing, on a handle not yet initialised (<see cref="IsInitialized"/>, TianWen #1759).</remarks>
         public readonly bool IsCfwPlugged
-            => IsQHYCCDControlAvailable(_handle, CONTROL_ID.CONTROL_CFWPORT) is QHYCCD_SUCCESS
+            => IsInitialized
+            && IsQHYCCDControlAvailable(_handle, CONTROL_ID.CONTROL_CFWPORT) is QHYCCD_SUCCESS
             && IsQHYCCDCFWPlugged(_handle) is QHYCCD_SUCCESS;
 
         /// <summary>
@@ -303,6 +333,11 @@ public static partial class QHYCamera
         {
             get
             {
+                if (!IsInitialized)
+                {
+                    return 0;
+                }
+
                 var slots = GetQHYCCDParam(_handle, CONTROL_ID.CONTROL_CFWSLOTSNUM);
                 return slots > 0 ? (int)slots : 0;
             }
@@ -314,6 +349,11 @@ public static partial class QHYCamera
         /// </summary>
         public readonly bool SetCfwPosition(int position)
         {
+            if (!IsInitialized)
+            {
+                return false;
+            }
+
             var order = position.ToString("X1");
             return SendOrder2QHYCCDCFW(_handle, order, (uint)order.Length) is QHYCCD_SUCCESS;
         }
@@ -324,6 +364,11 @@ public static partial class QHYCamera
         /// </summary>
         public readonly int GetCfwPosition()
         {
+            if (!IsInitialized)
+            {
+                return -1;
+            }
+
             var status = new StringBuilder(8);
             if (GetQHYCCDCFWStatus(_handle, status) is QHYCCD_SUCCESS && status.Length > 0)
             {
@@ -716,6 +761,11 @@ public static partial class QHYCamera
 
         public CMOSErrorCode StartDarkExposure()
         {
+            if (!IsInitialized)
+            {
+                return _handle == IntPtr.Zero ? CMOSErrorCode.CameraClosed : CMOSErrorCode.InvalidSequence;
+            }
+
             if (_hasMechanicalShutter)
                 ControlQHYCCDShutter(_handle, 1); // close shutter
 
@@ -732,7 +782,7 @@ public static partial class QHYCamera
         /// which no .NET handler can catch and which ends the whole process, with the camera's cooler left as it was. So
         /// the frame calls ask this first and refuse instead.
         /// </remarks>
-        public bool IsInitialized
+        public readonly bool IsInitialized
         {
             get
             {
@@ -848,8 +898,18 @@ public static partial class QHYCamera
 
         public CMOSErrorCode SetROIFormat(int width, int height, int bin, PixelDataFormat pixelDataFormat)
         {
-            SetQHYCCDBinMode(_handle, (uint)bin, (uint)bin);
-            SetQHYCCDBitsMode(_handle, pixelDataFormat is PixelDataFormat.RAW16 ? 16u : 8u);
+            // Each refusal is said (TianWen #1759): a refused 8-bit mode left the body writing 16-bit frames, twice the size
+            // the caller sized its buffer for.
+            if (SetQHYCCDBinMode(_handle, (uint)bin, (uint)bin) is not QHYCCD_SUCCESS)
+            {
+                return CMOSErrorCode.InvalidSize;
+            }
+
+            if (SetQHYCCDBitsMode(_handle, pixelDataFormat is PixelDataFormat.RAW16 ? 16u : 8u) is not QHYCCD_SUCCESS)
+            {
+                return CMOSErrorCode.InvalidImageFormat;
+            }
+
             return ToErrorCode(SetQHYCCDResolution(_handle, 0, 0, (uint)width, (uint)height));
         }
 
@@ -861,7 +921,62 @@ public static partial class QHYCamera
                 return _handle == IntPtr.Zero ? CMOSErrorCode.CameraClosed : CMOSErrorCode.InvalidSequence;
             }
 
-            return ToErrorCode(GetQHYCCDSingleFrame(_handle, out _, out _, out _, out _, buffer));
+            // GetQHYCCDSingleFrame takes NO size and writes whatever the body read out (TianWen #1759): a bit depth or a window
+            // the body changed on its own, or a colour body debayering, wrote past a buffer sized for what was asked. So it
+            // lands in a scratch of the size the SDK itself says it may write, and only a frame that fits is copied on.
+            var scratch = Scratch(out var scratchBytes);
+            if (scratch == IntPtr.Zero)
+            {
+                return CMOSErrorCode.GeneralError;
+            }
+
+            var read = GetQHYCCDSingleFrame(_handle, out var w, out var h, out var bpp, out var channels, scratch);
+            if (read is not QHYCCD_SUCCESS)
+            {
+                return ToErrorCode(read);
+            }
+
+            var bytes = (long)w * h * ((bpp + 7) / 8) * Math.Max(1u, channels);
+            if (bytes > bufferSize || bytes > scratchBytes)
+            {
+                return CMOSErrorCode.BufferTooSmall;
+            }
+
+            unsafe
+            {
+                Buffer.MemoryCopy((void*)scratch, (void*)buffer, bufferSize, bytes);
+            }
+
+            return CMOSErrorCode.Success;
+        }
+
+        /// <summary>The shared handle's download scratch, allocated on first use at the SDK's own frame size.</summary>
+        private readonly IntPtr Scratch(out int bytes)
+        {
+            lock (_sharedLock)
+            {
+                if (!_sharedHandles.TryGetValue(_id, out var state))
+                {
+                    bytes = 0;
+                    return IntPtr.Zero;
+                }
+
+                if (state.Scratch == IntPtr.Zero)
+                {
+                    var length = GetQHYCCDMemLength(_handle);
+                    if (length is 0 or > int.MaxValue)
+                    {
+                        bytes = 0;
+                        return IntPtr.Zero;
+                    }
+
+                    state.Scratch = Marshal.AllocHGlobal((int)length);
+                    state.ScratchBytes = (int)length;
+                }
+
+                bytes = state.ScratchBytes;
+                return state.Scratch;
+            }
         }
 
         public bool TryGetEffectiveArea(out int startX, out int startY, out int width, out int height)
