@@ -71,6 +71,7 @@ public static partial class QHYCamera
         private bool _hasMechanicalShutter;
         private bool _isTriggerCamera;
         private bool _isUSB3;
+        private string[]? _readoutModes;
 
         // Per-exposure state for QHY "read directly" cameras (ExpQHYCCDSingleFrame
         // returning QHYCCD_READ_DIRECTLY). Captured in StartExposureCore and consumed
@@ -183,20 +184,11 @@ public static partial class QHYCamera
                         shared.Initialized = true;
                     }
 
-                    // The DAL carries RAW Bayer data: a colour body is told never to debayer, whatever it was left at.
-                    if (result && _isColor)
-                    {
-                        _ = SetQHYCCDDebayerOnOff(_handle, false);
-                    }
-
-                    // The SDK's image adjustments are pinned at their neutral (measured on a QHY294PROC: brightness and
-                    // contrast run -1 to 1, gamma 0 to 2), so a value another program left cannot reach the frames. None of
-                    // the three is a DAL control any more (DALControlTypeToQHY).
                     if (result)
                     {
-                        PinNeutral(CONTROL_ID.CONTROL_BRIGHTNESS, 0.0);
-                        PinNeutral(CONTROL_ID.CONTROL_CONTRAST, 0.0);
-                        PinNeutral(CONTROL_ID.CONTROL_GAMMA, 1.0);
+                        AfterInit();
+                        // The geometry is the read mode's, which only an init applies: one set before it is read here.
+                        QueryCapabilities();
                     }
                 }
             }
@@ -210,7 +202,24 @@ public static partial class QHYCamera
             return result;
         }
 
-        private void PinNeutral(CONTROL_ID control, double neutral)
+        /// <summary>What every <c>InitQHYCCD</c> is followed by, the first and a readout mode's.</summary>
+        private readonly void AfterInit()
+        {
+            // The DAL carries RAW Bayer data: a colour body is told never to debayer, whatever it was left at.
+            if (_isColor)
+            {
+                _ = SetQHYCCDDebayerOnOff(_handle, false);
+            }
+
+            // The SDK's image adjustments are pinned at their neutral (measured on a QHY294PROC: brightness and
+            // contrast run -1 to 1, gamma 0 to 2), so a value another program left cannot reach the frames. None of
+            // the three is a DAL control any more (DALControlTypeToQHY).
+            PinNeutral(CONTROL_ID.CONTROL_BRIGHTNESS, 0.0);
+            PinNeutral(CONTROL_ID.CONTROL_CONTRAST, 0.0);
+            PinNeutral(CONTROL_ID.CONTROL_GAMMA, 1.0);
+        }
+
+        private readonly void PinNeutral(CONTROL_ID control, double neutral)
         {
             if (IsQHYCCDControlAvailable(_handle, control) is QHYCCD_SUCCESS)
             {
@@ -335,6 +344,18 @@ public static partial class QHYCamera
 
             // Check USB3
             _isUSB3 = IsQHYCCDControlAvailable(_handle, CONTROL_ID.CONTROL_SPEED) is QHYCCD_SUCCESS;
+
+            // Readout modes, by QHY's own names; a body with one mode answers none.
+            if (_readoutModes is null && GetQHYCCDNumberOfReadModes(_handle, out var modeCount) is QHYCCD_SUCCESS && modeCount is > 1 and < 64)
+            {
+                var modes = new string[modeCount];
+                for (var i = 0u; i < modeCount; i++)
+                {
+                    var name = new StringBuilder(128);
+                    modes[i] = GetQHYCCDReadModeName(_handle, i, name) is QHYCCD_SUCCESS && name.Length > 0 ? name.ToString().Trim() : $"Mode {i}";
+                }
+                _readoutModes = modes;
+            }
         }
 
         // --- CFW (camera-cable filter wheel) methods ---
@@ -522,6 +543,63 @@ public static partial class QHYCamera
         /// setting a balance has three channels to write.
         /// </summary>
         public bool HasThreeChannelWhiteBalance => _isColor;
+
+        /// <summary>The body's readout modes by QHY's names (a QHY294PROC: "11M MODE", "47M MODE"), read on open.</summary>
+        public readonly IReadOnlyList<string> ReadoutModes => _readoutModes ?? [];
+
+        public readonly int ReadoutMode
+        {
+            get
+            {
+                lock (_sharedLock)
+                {
+                    return _handle != IntPtr.Zero && _readoutModes is { Length: > 0 } && GetQHYCCDReadMode(_handle, out var mode) is QHYCCD_SUCCESS
+                        ? (int)mode
+                        : -1;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Sets QHY's read mode and, on a handle already initialised, initialises it again, which is how the SDK applies
+        /// one; then reads the geometry back. Measured on a QHY294PROC: a re-init keeps gain, offset, USB traffic, the
+        /// white balance and the cooler's target, and <c>GetQHYCCDMemLength</c> answers the largest mode's size in every
+        /// mode, so the download scratch stays valid. Before the first <see cref="Init"/> the mode is only set, and that
+        /// init applies it. A cable filter wheel shares the handle, so it is re-initialised with the camera.
+        /// </summary>
+        public bool TrySetReadoutMode(int mode)
+        {
+            lock (_sharedLock)
+            {
+                if (_handle == IntPtr.Zero || _readoutModes is not { } modes || mode < 0 || mode >= modes.Length
+                    || SetQHYCCDReadMode(_handle, (uint)mode) is not QHYCCD_SUCCESS)
+                {
+                    return false;
+                }
+
+                if (_sharedHandles.TryGetValue(_id, out var shared) && shared.Initialized)
+                {
+                    SetQHYCCDStreamMode(_handle, 0);
+                    if (InitQHYCCD(_handle) is not QHYCCD_SUCCESS)
+                    {
+                        return false;
+                    }
+                    AfterInit();
+
+                    // Never smaller than the frame the SDK writes now; the 294 answers one size for both modes.
+                    if (shared.Scratch != IntPtr.Zero && GetQHYCCDMemLength(_handle) > (uint)shared.ScratchBytes)
+                    {
+                        Marshal.FreeHGlobal(shared.Scratch);
+                        shared.Scratch = IntPtr.Zero;
+                        shared.ScratchBytes = 0;
+                    }
+                }
+
+                QueryCapabilities();
+                RefineAdcBitDepth();
+                return true;
+            }
+        }
 
         /// <summary>The white balance's neutral on a colour QHY body: <see cref="WhiteBalanceNeutral"/> on all three channels,
         /// the bounds as the SDK states them.</summary>
