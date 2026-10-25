@@ -188,6 +188,16 @@ public static partial class QHYCamera
                     {
                         _ = SetQHYCCDDebayerOnOff(_handle, false);
                     }
+
+                    // The SDK's image adjustments are pinned at their neutral (measured on a QHY294PROC: brightness and
+                    // contrast run -1 to 1, gamma 0 to 2), so a value another program left cannot reach the frames. None of
+                    // the three is a DAL control any more (DALControlTypeToQHY).
+                    if (result)
+                    {
+                        PinNeutral(CONTROL_ID.CONTROL_BRIGHTNESS, 0.0);
+                        PinNeutral(CONTROL_ID.CONTROL_CONTRAST, 0.0);
+                        PinNeutral(CONTROL_ID.CONTROL_GAMMA, 1.0);
+                    }
                 }
             }
 
@@ -198,6 +208,14 @@ public static partial class QHYCamera
             }
 
             return result;
+        }
+
+        private void PinNeutral(CONTROL_ID control, double neutral)
+        {
+            if (IsQHYCCDControlAvailable(_handle, control) is QHYCCD_SUCCESS)
+            {
+                _ = SetQHYCCDParam(_handle, control, neutral);
+            }
         }
 
         /// <summary>
@@ -501,28 +519,35 @@ public static partial class QHYCamera
         /// </summary>
         public bool HasThreeChannelWhiteBalance => _isColor;
 
-        /// <summary>
-        /// Not answered for QHY, deliberately.
-        /// </summary>
+        /// <summary>The white balance's neutral on a colour QHY body: <see cref="WhiteBalanceNeutral"/> on all three channels,
+        /// the bounds as the SDK states them.</summary>
         /// <remarks>
-        /// <para>The BOUNDS are readable (<c>GetQHYCCDParamMinMaxStep</c> on <c>CONTROL_WBR</c>),
-        /// but the member's whole purpose is the NEUTRAL, and that has not been measured on a QHY
-        /// body. It cannot be measured here either: every QHY camera in this collection is mono
-        /// (178M, 183M), and a mono body has no white balance to calibrate against.</para>
-        /// <para>Returning a guessed neutral would be worse than returning nothing. The DAL's
-        /// contract warns that a vendor's DEFAULT is a third thing again, typically a pleasant
-        /// daylight balance rather than unity, so reading the default and calling it neutral is
-        /// precisely the mistake this interface exists to stop. False keeps the caller on its
-        /// documented fallback, which is what QHY bodies already got.</para>
-        /// <para>To close this: capture two frames on a colour QHY at two different WB_R values and
-        /// compare the per-photosite quantisation step, exactly as was done for ZWO (65 measured
-        /// 1.312 = 65/50) and Player One (0 measured 1.000).</para>
+        /// <para><b>Measured on a QHY294PROC (2026-10-25).</b> The SDK states 1 to 239 for each of <c>CONTROL_WBR</c>,
+        /// <c>CONTROL_WBG</c> and <c>CONTROL_WBB</c> and opens the body at 16 on all three. A bias through N.I.N.A., which
+        /// leaves them there, reads one level on all four photosites; through TianWen's fallback of 50 on red and blue (green
+        /// left at 16), red and blue read 3.12 times green at two offsets and three gains (4072 against 1304 ADU), and
+        /// 50 / 16 = 3.125. So the balance is a linear digital gain on the raw stream with unity at 16, and every frame the
+        /// fallback reached had its red and blue pedestal and signal scaled by 3.1.</para>
+        /// <para>A mono body has no balance and answers false, which keeps its caller off the controls.</para>
         /// </remarks>
         public bool TryGetWhiteBalanceRange(out int min, out int max, out int neutral)
         {
             min = max = neutral = 0;
-            return false;
+            if (!_isColor
+                || IsQHYCCDControlAvailable(_handle, CONTROL_ID.CONTROL_WBR) is not QHYCCD_SUCCESS
+                || GetQHYCCDParamMinMaxStep(_handle, CONTROL_ID.CONTROL_WBR, out var dMin, out var dMax, out _) is not QHYCCD_SUCCESS
+                || WhiteBalanceNeutral < dMin || WhiteBalanceNeutral > dMax)
+            {
+                return false;
+            }
+            min = (int)dMin;
+            max = (int)dMax;
+            neutral = WhiteBalanceNeutral;
+            return true;
         }
+
+        /// <summary>Unity on each of QHY's white-balance channels (see <see cref="TryGetWhiteBalanceRange"/>).</summary>
+        public const int WhiteBalanceNeutral = 16;
 
         public bool TryGetControlRange(CMOSControlType ctrlType, out int min, out int max)
         {
@@ -1029,13 +1054,18 @@ public static partial class QHYCamera
         {
             CMOSControlType.Gain => CONTROL_ID.CONTROL_GAIN,
             CMOSControlType.Exposure => CONTROL_ID.CONTROL_EXPOSURE,
-            CMOSControlType.Gamma => CONTROL_ID.CONTROL_GAMMA,
+            // Gamma is pinned at 1 on open, never a DAL control: the DAL's scale is ZWO's (50 linear), QHY's runs 0 to 2 with 1
+            // linear, and the SDK stores an out-of-range 50 without complaint.
+            CMOSControlType.Gamma => (CONTROL_ID)int.MaxValue,
             CMOSControlType.WB_R => CONTROL_ID.CONTROL_WBR,
             // Green exists on QHY and had no DAL control to map to before 3.0, so writing a
             // balance left it wherever it was last put.
             CMOSControlType.WB_G => CONTROL_ID.CONTROL_WBG,
             CMOSControlType.WB_B => CONTROL_ID.CONTROL_WBB,
-            CMOSControlType.Brightness => CONTROL_ID.CONTROL_BRIGHTNESS,
+            // The DAL's Brightness is the sensor's black level (ZWO's ASI_BRIGHTNESS, SVBONY's black level, Player One's
+            // offset), which on QHY is CONTROL_OFFSET. CONTROL_BRIGHTNESS is a software image brightness of -1 to 1: mapped to
+            // it, an offset was never set and every offset above 1 was refused as out of range.
+            CMOSControlType.Brightness => CONTROL_ID.CONTROL_OFFSET,
             CMOSControlType.BandwidthOverload => CONTROL_ID.CONTROL_USBTRAFFIC,
             CMOSControlType.Overclock => CONTROL_ID.CONTROL_SPEED,
             CMOSControlType.TemperatureDeci => CONTROL_ID.CONTROL_CURTEMP,
