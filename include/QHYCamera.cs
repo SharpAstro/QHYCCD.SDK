@@ -1062,10 +1062,9 @@ public static partial class QHYCamera
             // balance left it wherever it was last put.
             CMOSControlType.WB_G => CONTROL_ID.CONTROL_WBG,
             CMOSControlType.WB_B => CONTROL_ID.CONTROL_WBB,
-            // The DAL's Brightness is the sensor's black level (ZWO's ASI_BRIGHTNESS, SVBONY's black level, Player One's
-            // offset), which on QHY is CONTROL_OFFSET. CONTROL_BRIGHTNESS is a software image brightness of -1 to 1: mapped to
-            // it, an offset was never set and every offset above 1 was refused as out of range.
-            CMOSControlType.Brightness => CONTROL_ID.CONTROL_OFFSET,
+            // The black level is CONTROL_OFFSET. CONTROL_BRIGHTNESS is a software image brightness of -1 to 1: mapped to it, as
+            // the DAL's old name Brightness invited, an offset was never set and every offset above 1 was refused as out of range.
+            CMOSControlType.BlackLevel => CONTROL_ID.CONTROL_OFFSET,
             CMOSControlType.BandwidthOverload => CONTROL_ID.CONTROL_USBTRAFFIC,
             CMOSControlType.Overclock => CONTROL_ID.CONTROL_SPEED,
             CMOSControlType.TemperatureDeci => CONTROL_ID.CONTROL_CURTEMP,
