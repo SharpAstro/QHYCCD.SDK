@@ -320,10 +320,14 @@ public static partial class QHYCamera
             _hasMechanicalShutter = IsQHYCCDControlAvailable(_handle, CONTROL_ID.CAM_MECHANICALSHUTTER) is QHYCCD_SUCCESS;
             _isTriggerCamera = IsQHYCCDControlAvailable(_handle, CONTROL_ID.CAM_TRIGER_INTERFACE) is QHYCCD_SUCCESS;
 
+            // The SDK answers the Bayer pattern as the RETURN VALUE of IsQHYCCDControlAvailable(CAM_COLOR)
+            // (BAYER_GB = 1 .. BAYER_RG = 4); GetQHYCCDParam on either colour control answers QHYCCD_ERROR.
+            // Reading it through GetQHYCCDParam left every colour body Monochrome (measured on a QHY294PROC:
+            // CAM_COLOR returns 4, both GetQHYCCDParam calls 0xFFFFFFFF).
             if (_isColor)
             {
-                var bayerValue = GetQHYCCDParam(_handle, CONTROL_ID.CAM_IS_COLOR);
-                if (bayerValue >= 1 && bayerValue <= 4)
+                var bayerValue = IsQHYCCDControlAvailable(_handle, CONTROL_ID.CAM_COLOR);
+                if (bayerValue is >= 1 and <= 4)
                 {
                     _bayerId = (BAYER_ID)(int)bayerValue;
                 }
