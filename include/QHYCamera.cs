@@ -217,6 +217,13 @@ public static partial class QHYCamera
             PinNeutral(CONTROL_ID.CONTROL_BRIGHTNESS, 0.0);
             PinNeutral(CONTROL_ID.CONTROL_CONTRAST, 0.0);
             PinNeutral(CONTROL_ID.CONTROL_GAMMA, 1.0);
+
+            // Defect pixel correction replaces hot pixels in the camera, differently frame to frame, so a dark stops matching
+            // its lights pixel for pixel and the stacker's own bad pixel map never sees the defects it is built to find. Off,
+            // as SVBony.SDK turns off SVB_BAD_PIXEL_CORRECTION_ENABLE at every open. Written whether or not the SDK calls it
+            // available: a QHYminiCam8M on SDK 25.09.29 answers IsQHYCCDControlAvailable(CONTROL_DPC) with an error yet takes
+            // the write (it reads back 0 after it), so PinNeutral's check would have left it on.
+            _ = SetQHYCCDParam(_handle, CONTROL_ID.CONTROL_DPC, 0.0);
         }
 
         private readonly void PinNeutral(CONTROL_ID control, double neutral)
@@ -227,52 +234,73 @@ public static partial class QHYCamera
             }
         }
 
+        /// <summary>One measured read mode: a model (matched as a prefix of QHY's model name) and the SDK's own mode name,
+        /// the converter's depth read off a bias's level spacing, and whether the mode stitches two readouts into one.</summary>
+        private readonly record struct KnownReadoutMode(string ModelPrefix, string Mode, int AdcBits, bool CombinedReadout);
+
         /// <summary>
-        /// Refines the reported <see cref="BitDepth"/> from the container/transfer width that
-        /// <see cref="GetQHYCCDChipInfo"/> reports (always 8 or 16) to the sensor's true ADC resolution
-        /// when the camera exposes it via <see cref="CONTROL_ID.OutputDataActualBits"/> -- e.g. 14 for
-        /// the QHY294. Requires <see cref="InitQHYCCD"/> to have run first (control params are only valid
-        /// post-init), so it is called from <see cref="Init"/>, not <see cref="QueryCapabilities"/>.
+        /// The ADC depth of every read mode measured on hardware (TianWen #1859). Every QHY mode measured delivers its
+        /// levels LEFT-ALIGNED in the 16-bit word (see <see cref="DeliversContainerScaledPixels"/>), so the depth is read
+        /// off a bias as the spacing between levels: 4 is 14 bits, 16 is 12, 1 is 16. A model or mode missing here reports
+        /// the container width, which claims nothing; add a row once a bias of it has been looked at.
+        /// </summary>
+        private static readonly KnownReadoutMode[] KnownReadoutModes =
+        [
+            // QHYminiCam8M, IMX585, 2026-10-27: Full Resolution steps 16; Linearity HDR uses every bit, two readouts combined.
+            new("QHYminiCam8", "Full Resolution", 12, CombinedReadout: false),
+            new("QHYminiCam8", "Linearity HDR", 16, CombinedReadout: true),
+            // QHY294PROC, 2026-10-25 biases: 11M MODE steps 4, 47M MODE steps 16.
+            new("QHY294", "11M MODE", 14, CombinedReadout: false),
+            new("QHY294", "47M MODE", 12, CombinedReadout: false),
+        ];
+
+        private static KnownReadoutMode? FindKnownReadoutMode(string model, string? mode)
+        {
+            foreach (var known in KnownReadoutModes)
+            {
+                if (mode is not null
+                    && model.StartsWith(known.ModelPrefix, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(mode, known.Mode, StringComparison.OrdinalIgnoreCase))
+                {
+                    return known;
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>The read mode the camera is in, from the table of measured ones, or null when it is not listed.</summary>
+        private readonly KnownReadoutMode? CurrentKnownReadoutMode
+        {
+            get
+            {
+                lock (_sharedLock)
+                {
+                    return _handle != IntPtr.Zero && _readoutModes is { Length: > 0 } modes
+                        && GetQHYCCDReadMode(_handle, out var mode) is QHYCCD_SUCCESS && mode < modes.Length
+                        ? FindKnownReadoutMode(_model, modes[mode])
+                        : null;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Sets the reported <see cref="BitDepth"/> to the current read mode's measured ADC depth (<see cref="KnownReadoutModes"/>),
+        /// or back to the container width that <see cref="GetQHYCCDChipInfo"/> reports when the mode is not listed. Called after
+        /// every init and read-mode change.
         /// <para>
-        /// <b>Why this matters:</b> a 14-bit sensor's samples still travel in a 16-bit container, but the
-        /// data the SDK hands us is native (LSB-aligned) -- the consuming driver copies the delivered
-        /// 16-bit words out verbatim, it does NOT left-shift to fill the container the way N.I.N.A. does
-        /// on recording. So the true saturation point is 2^14-1 = 16383, not the container's 65535, and
-        /// the consumer derives its full-scale ADU from this value. Reporting the container width
-        /// overstated the full-scale 4x for such sensors.
-        /// </para>
-        /// <para>
-        /// <b>Alignment caveat (needs hardware verification):</b> the above assumes native LSB-aligned
-        /// delivery. QHY also exposes <see cref="CONTROL_ID.OutputDataAlignment"/>; should a camera/mode
-        /// ever be found to deliver MSB-aligned (left-shifted, container-spanning) data, its delivered
-        /// full-scale would be the container width again and this refinement would need to consult that
-        /// control. Not acted on here without hardware to confirm the numeric convention, because
-        /// guessing wrong in that direction would over-scale (clamp highlights to white) -- whereas the
-        /// current native assumption only ever under-scales, which an auto-stretch recovers. The guard
-        /// (positive and never exceeding the container width) means the worst case is a no-op that
-        /// reproduces the previous container-width behaviour.
+        /// <b><see cref="CONTROL_ID.OutputDataActualBits"/> is not asked.</b> A QHYminiCam8M answers 8 in every mode, on SDK
+        /// 25.09.29 and 26.07.28 alike, with 16-bit transfer set, and offers no <see cref="CONTROL_ID.OutputDataAlignment"/>;
+        /// taken as the depth, that 8 made the full scale 255. It is the native SDK's own misreport, separate from QHY's
+        /// ASCOM driver's <c>MaxADU</c> of 255, which is only that driver's stored default.
         /// </para>
         /// </summary>
         private void RefineAdcBitDepth()
         {
-            // Reachable on the shared-handle path (the camera and CFW structs sharing one native
-            // handle can both hit Init()'s already-initialized branch around connect time), so the
-            // native queries are serialized under _sharedLock -- mirroring Open()'s in-lock
-            // QueryCapabilities call for the identical case. The QHY SDK makes no thread-safety
-            // promise for concurrent param queries on one handle.
+            var bits = CurrentKnownReadoutMode is { } known && known.AdcBits <= _bitDepth ? known.AdcBits : 0;
             lock (_sharedLock)
             {
-                if (_handle == IntPtr.Zero
-                    || IsQHYCCDControlAvailable(_handle, CONTROL_ID.OutputDataActualBits) is not QHYCCD_SUCCESS)
-                {
-                    return;
-                }
-
-                var actualBits = GetQHYCCDParam(_handle, CONTROL_ID.OutputDataActualBits);
-                if (!double.IsNaN(actualBits) && actualBits > 0 && actualBits <= _bitDepth)
-                {
-                    _adcBitDepth = (int)actualBits;
-                }
+                _adcBitDepth = bits;
             }
         }
 
@@ -436,15 +464,21 @@ public static partial class QHYCamera
         public int MaxHeight => _maxHeight;
 
         /// <summary>
-        /// The sensor's ADC resolution in bits when known (refined post-init from
-        /// <see cref="CONTROL_ID.OutputDataActualBits"/>, e.g. 14 for the QHY294), otherwise the
-        /// container/transfer width from <see cref="GetQHYCCDChipInfo"/> (8/16). This is the ADC
-        /// resolution the <see cref="ICMOSNativeInterface"/> contract asks for -- the value a consumer
-        /// turns into a full-scale ADU / max value -- NOT the transfer format selector (that stays on
-        /// <see cref="_bitDepth"/>, used by <see cref="GetROIFormat"/> to pick RAW8 vs RAW16). See
-        /// <see cref="RefineAdcBitDepth"/> for the native-alignment rationale.
+        /// The converter's resolution in bits for the current read mode when it has been measured (14 for a QHY294's 11M
+        /// MODE, 12 for its 47M MODE; see <see cref="RefineAdcBitDepth"/>), otherwise the container/transfer width from
+        /// <see cref="GetQHYCCDChipInfo"/> (8/16). It says how many LEVELS there are, never the full scale, which
+        /// <see cref="DeliversContainerScaledPixels"/> makes the container's. Not the transfer format selector either (that
+        /// stays on <see cref="_bitDepth"/>, used by <see cref="GetROIFormat"/> to pick RAW8 vs RAW16).
         /// </summary>
         public int BitDepth => _adcBitDepth > 0 ? _adcBitDepth : _bitDepth;
+
+        /// <summary>
+        /// QHY hands every read mode measured over LEFT-ALIGNED in the 16-bit word (TianWen #1859): a QHY294PROC's 11M MODE
+        /// in steps of 4 (14 bits), its 47M MODE and a QHYminiCam8M's Full Resolution in steps of 16 (12 bits), the
+        /// miniCAM8's Linearity HDR on every level. So the full scale is the container's whatever the depth, as for Player
+        /// One and SVBONY. The opposite was assumed until then (TianWen #701), which no frame had been checked against.
+        /// </summary>
+        public bool DeliversContainerScaledPixels => true;
 
         public double PixelSize => _pixelSizeX;
 
@@ -467,11 +501,19 @@ public static partial class QHYCamera
         /// unit <c>EGAIN</c> wants, but the SDK manual documents the call only as "system gain curve
         /// value" without stating a unit, so the SCALE should be confirmed against a body with a
         /// published gain curve before anything trusts it quantitatively.</para>
+        /// <para><b>Unknown in a mode that stitches two readouts</b> (a QHYminiCam8M's Linearity HDR): that mode pins the gain
+        /// (9 on the miniCAM8, whatever is asked), and the curve at that gain is the single-readout mode's, which says nothing
+        /// of a frame combined from a high- and a low-gain readout (TianWen #1859).</para>
         /// </remarks>
         public double ElectronPerADU
         {
             get
             {
+                if (CurrentKnownReadoutMode is { CombinedReadout: true })
+                {
+                    return double.NaN;
+                }
+
                 var gain = GetQHYCCDParam(_handle, CONTROL_ID.CONTROL_GAIN);
                 if (!double.IsFinite(gain) || gain >= QHYCCD_ERROR)
                 {
@@ -564,7 +606,8 @@ public static partial class QHYCamera
         /// Sets QHY's read mode and, on a handle already initialised, initialises it again, which is how the SDK applies
         /// one; then reads the geometry back. Measured on a QHY294PROC: a re-init keeps gain, offset, USB traffic, the
         /// white balance and the cooler's target, and <c>GetQHYCCDMemLength</c> answers the largest mode's size in every
-        /// mode, so the download scratch stays valid. Before the first <see cref="Init"/> the mode is only set, and that
+        /// mode (a QHYminiCam8M's Linearity HDR answers twice its Full Resolution's, so the scratch is then sized again). A
+        /// re-init leaves the frame format to be set again, which this does at the whole sensor and bin 1. Before the first <see cref="Init"/> the mode is only set, and that
         /// init applies it. A cable filter wheel shares the handle, so it is re-initialised with the camera.
         /// </summary>
         public bool TrySetReadoutMode(int mode)
@@ -596,6 +639,19 @@ public static partial class QHYCamera
                 }
 
                 QueryCapabilities();
+
+                // A re-init leaves the frame format half applied (measured on a QHYminiCam8M on SDK 25.09.29 and 26.07.28):
+                // its Linearity HDR frames came back with the right half of every row zero until bin, bits and resolution
+                // were set again, while GetQHYCCDCurrentROI already answered the whole sensor, so a caller comparing the ROI
+                // saw nothing to set. The frame goes back to the whole sensor at bin 1, as the DAL says a mode change does.
+                if (shared is { Initialized: true }
+                    && (SetQHYCCDBinMode(_handle, 1, 1) is not QHYCCD_SUCCESS
+                        || SetQHYCCDBitsMode(_handle, _bitDepth > 8 ? 16u : 8u) is not QHYCCD_SUCCESS
+                        || SetQHYCCDResolution(_handle, 0, 0, (uint)_maxWidth, (uint)_maxHeight) is not QHYCCD_SUCCESS))
+                {
+                    return false;
+                }
+
                 RefineAdcBitDepth();
                 return true;
             }
@@ -1263,6 +1319,13 @@ public static partial class QHYCamera
         CAM_WATCH_DOG_FPGA,
         CAM_BIN6X6MODE,
         CAM_BIN8X8MODE,
+
+        // The SDK's "test" range (qhyccdstruct.h, from 24-12-26), numbered on its own.
+        CONTROL_DPC = 1032,
+        CONTROL_DPC_value,
+        CONTROL_HDR,
+        CONTROL_HDR_L_k,
+        CONTROL_HDR_L_b,
     }
 
     public enum BAYER_ID
