@@ -26,6 +26,16 @@ public static partial class QHYCamera
         /// </summary>
         public IntPtr Scratch;
         public int ScratchBytes;
+
+        /// <summary>True between <c>BeginQHYCCDLive</c> and <c>StopQHYCCDLive</c>: the handle is in live (stream) mode.</summary>
+        public bool Live;
+
+        /// <summary>
+        /// The bin and bits the last <c>SetROIFormat</c> set (0 before any), which the SDK cannot be asked for and a switch
+        /// between single-frame and live mode, being a re-init, has to set again.
+        /// </summary>
+        public int FrameBin;
+        public int FrameBits;
     }
 
     /// <summary>
@@ -71,6 +81,7 @@ public static partial class QHYCamera
         private bool _hasMechanicalShutter;
         private bool _isTriggerCamera;
         private bool _isUSB3;
+        private bool _canLiveVideo;
         private string[]? _readoutModes;
 
         // Per-exposure state for QHY "read directly" cameras (ExpQHYCCDSingleFrame
@@ -327,6 +338,13 @@ public static partial class QHYCamera
                     }
 
                     _sharedHandles.Remove(_id);
+                    if (state.Live)
+                    {
+                        // A stream left running is stopped before the handle closes under it.
+                        _ = StopQHYCCDLive(_handle);
+                        state.Live = false;
+                    }
+
                     if (state.Scratch != IntPtr.Zero)
                     {
                         Marshal.FreeHGlobal(state.Scratch);
@@ -372,6 +390,7 @@ public static partial class QHYCamera
 
             // Check USB3
             _isUSB3 = IsQHYCCDControlAvailable(_handle, CONTROL_ID.CONTROL_SPEED) is QHYCCD_SUCCESS;
+            _canLiveVideo = IsQHYCCDControlAvailable(_handle, CONTROL_ID.CAM_LIVEVIDEOMODE) is QHYCCD_SUCCESS;
 
             // Readout modes, by QHY's own names; a body with one mode answers none.
             if (_readoutModes is null && GetQHYCCDNumberOfReadModes(_handle, out var modeCount) is QHYCCD_SUCCESS && modeCount is > 1 and < 64)
@@ -746,7 +765,6 @@ public static partial class QHYCamera
 
         /// <summary>The TEC duty at full drive, the top of <c>CONTROL_CURPWM</c> and <c>CONTROL_MANULPWM</c>.</summary>
         private const double MaxPwm = 255;
-
         public CMOSErrorCode SetControlValue(CMOSControlType controlType, int value, bool isAuto = false)
         {
             if (controlType is CMOSControlType.CoolerOn)
@@ -1068,12 +1086,189 @@ public static partial class QHYCamera
                 return CMOSErrorCode.InvalidSize;
             }
 
-            if (SetQHYCCDBitsMode(_handle, pixelDataFormat is PixelDataFormat.RAW16 ? 16u : 8u) is not QHYCCD_SUCCESS)
+            var bits = pixelDataFormat is PixelDataFormat.RAW16 ? 16u : 8u;
+            if (SetQHYCCDBitsMode(_handle, bits) is not QHYCCD_SUCCESS)
             {
                 return CMOSErrorCode.InvalidImageFormat;
             }
 
+            lock (_sharedLock)
+            {
+                if (_sharedHandles.TryGetValue(_id, out var state))
+                {
+                    state.FrameBin = bin;
+                    state.FrameBits = (int)bits;
+                }
+            }
+
             return ToErrorCode(SetQHYCCDResolution(_handle, 0, 0, (uint)width, (uint)height));
+        }
+
+        // ---- Video ----------------------------------------------------------------------------------------------------
+
+        /// <summary>The SDK's own answer, <c>IsQHYCCDControlAvailable(CAM_LIVEVIDEOMODE)</c>, read with the capabilities.</summary>
+        public readonly bool CanVideoCapture => _canLiveVideo;
+
+        /// <summary>
+        /// False until a body shows otherwise: QHY moves the window only with <c>SetQHYCCDResolution</c>, origin and size
+        /// together, and whether that is safe mid-stream is unmeasured (TianWen docs/plans/planetary-native-video.md, D.5).
+        /// </summary>
+        public readonly bool CanPanRoiWhileStreaming => false;
+
+        /// <summary>
+        /// Puts the handle in live mode and starts the stream: <c>SetQHYCCDStreamMode(1)</c> and <c>InitQHYCCD</c>, which is
+        /// the only way QHY's SDK changes mode, then everything that init loses set again (bin, bits, the window with its
+        /// origin, exposure, gain and offset), then <c>BeginQHYCCDLive</c>. QHY's own live sample runs the same order.
+        /// </summary>
+        public CMOSErrorCode StartVideoCapture()
+        {
+            lock (_sharedLock)
+            {
+                if (!IsInitialized || !_sharedHandles.TryGetValue(_id, out var state))
+                {
+                    return _handle == IntPtr.Zero ? CMOSErrorCode.CameraClosed : CMOSErrorCode.InvalidSequence;
+                }
+
+                if (state.Live)
+                {
+                    return CMOSErrorCode.InvalidSequence;
+                }
+
+                if (!TrySwitchStreamMode(state, live: true))
+                {
+                    return CMOSErrorCode.GeneralError;
+                }
+
+                var begun = BeginQHYCCDLive(_handle);
+                if (begun is not QHYCCD_SUCCESS)
+                {
+                    _ = TrySwitchStreamMode(state, live: false);
+                    return ToErrorCode(begun);
+                }
+
+                state.Live = true;
+                return CMOSErrorCode.Success;
+            }
+        }
+
+        /// <summary>
+        /// Stops the stream and puts the handle back in single-frame mode, with a re-init and the settings set again, so the
+        /// next exposure runs as one before the stream did (the single-frame path only sets the mode, it does not re-init).
+        /// </summary>
+        public CMOSErrorCode StopVideoCapture()
+        {
+            lock (_sharedLock)
+            {
+                if (_handle == IntPtr.Zero || !_sharedHandles.TryGetValue(_id, out var state))
+                {
+                    return CMOSErrorCode.CameraClosed;
+                }
+
+                if (!state.Live)
+                {
+                    return CMOSErrorCode.Success;
+                }
+
+                var stopped = StopQHYCCDLive(_handle);
+                state.Live = false;
+                return TrySwitchStreamMode(state, live: false) ? ToErrorCode(stopped) : CMOSErrorCode.GeneralError;
+            }
+        }
+
+        /// <summary>
+        /// Waits at most <paramref name="waitMs"/> for the stream's next frame. <c>GetQHYCCDLiveFrame</c> does not wait: it
+        /// answers an error until a frame is ready, so this asks every millisecond until one is or the time is up
+        /// (<see cref="CMOSErrorCode.Timeout"/>, which the caller answers by asking again). Like a single frame, it takes no
+        /// size, so it lands in the SDK-sized scratch and only a frame that fits <paramref name="buffer"/> is copied on.
+        /// </summary>
+        public CMOSErrorCode GetVideoData(IntPtr buffer, int bufferSize, int waitMs)
+        {
+            if (!IsInitialized)
+            {
+                return _handle == IntPtr.Zero ? CMOSErrorCode.CameraClosed : CMOSErrorCode.InvalidSequence;
+            }
+
+            var scratch = Scratch(out var scratchBytes);
+            if (scratch == IntPtr.Zero)
+            {
+                return CMOSErrorCode.GeneralError;
+            }
+
+            var deadline = System.Diagnostics.Stopwatch.GetTimestamp() + (long)waitMs * System.Diagnostics.Stopwatch.Frequency / 1000;
+            while (true)
+            {
+                if (GetQHYCCDLiveFrame(_handle, out var w, out var h, out var bpp, out var channels, scratch) is QHYCCD_SUCCESS)
+                {
+                    var bytes = (long)w * h * ((bpp + 7) / 8) * Math.Max(1u, channels);
+                    if (bytes > bufferSize || bytes > scratchBytes)
+                    {
+                        return CMOSErrorCode.BufferTooSmall;
+                    }
+
+                    unsafe
+                    {
+                        Buffer.MemoryCopy((void*)scratch, (void*)buffer, bufferSize, bytes);
+                    }
+
+                    return CMOSErrorCode.Success;
+                }
+
+                if (System.Diagnostics.Stopwatch.GetTimestamp() >= deadline)
+                {
+                    return CMOSErrorCode.Timeout;
+                }
+
+                Thread.Sleep(1);
+            }
+        }
+
+        /// <summary>
+        /// Switches the handle between single-frame (0) and live (1) mode, which on QHY is a re-init, and sets again what the
+        /// re-init loses: the frame format (bin, bits, and the window WITH its origin, which a readout-mode change resets to
+        /// the whole sensor instead) and the exposure. Gain and offset survive a re-init on a QHY294PROC (see
+        /// <see cref="TrySetReadoutMode"/>) and are set again anyway, being cheap and unmeasured in live mode. The caller
+        /// holds <c>_sharedLock</c>.
+        /// </summary>
+        private readonly bool TrySwitchStreamMode(SharedHandleState state, bool live)
+        {
+            if (GetQHYCCDCurrentROI(_handle, out var x, out var y, out var w, out var h) is not QHYCCD_SUCCESS)
+            {
+                return false;
+            }
+
+            var exposure = GetQHYCCDParam(_handle, CONTROL_ID.CONTROL_EXPOSURE);
+            var gain = GetQHYCCDParam(_handle, CONTROL_ID.CONTROL_GAIN);
+            var offset = GetQHYCCDParam(_handle, CONTROL_ID.CONTROL_OFFSET);
+            var bin = state.FrameBin > 0 ? (uint)state.FrameBin : 1u;
+            var bits = state.FrameBits > 0 ? (uint)state.FrameBits : _bitDepth > 8 ? 16u : 8u;
+
+            if (SetQHYCCDStreamMode(_handle, live ? (byte)1 : (byte)0) is not QHYCCD_SUCCESS
+                || InitQHYCCD(_handle) is not QHYCCD_SUCCESS)
+            {
+                return false;
+            }
+
+            AfterInit();
+
+            // Never smaller than the frame the SDK writes now, as after a readout-mode re-init.
+            if (state.Scratch != IntPtr.Zero && GetQHYCCDMemLength(_handle) > (uint)state.ScratchBytes)
+            {
+                Marshal.FreeHGlobal(state.Scratch);
+                state.Scratch = IntPtr.Zero;
+                state.ScratchBytes = 0;
+            }
+
+            if (SetQHYCCDBinMode(_handle, bin, bin) is not QHYCCD_SUCCESS
+                || SetQHYCCDBitsMode(_handle, bits) is not QHYCCD_SUCCESS
+                || SetQHYCCDResolution(_handle, x, y, w, h) is not QHYCCD_SUCCESS)
+            {
+                return false;
+            }
+
+            _ = SetQHYCCDParam(_handle, CONTROL_ID.CONTROL_EXPOSURE, exposure);
+            _ = SetQHYCCDParam(_handle, CONTROL_ID.CONTROL_GAIN, gain);
+            _ = SetQHYCCDParam(_handle, CONTROL_ID.CONTROL_OFFSET, offset);
+            return true;
         }
 
         public CMOSErrorCode GetDataAfterExposure(IntPtr buffer, int bufferSize)
