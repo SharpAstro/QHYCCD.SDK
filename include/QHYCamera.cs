@@ -1218,9 +1218,16 @@ public static partial class QHYCamera
                     return CMOSErrorCode.Timeout;
                 }
 
-                Thread.Sleep(1);
+                // Not Thread.Sleep(1): on Windows that lasts a whole 15.6 ms timer tick, measured as about 15 ms a poll on a
+                // PoleMaster (2026-11-05), so each frame was picked up up to a tick late. PreciseWait ends on time. The rate is
+                // the camera's either way (3.9 fps, 468 frames over four 30 s streams, none repeated); what this buys is a frame
+                // collected within about 1.5 ms of being ready, which a video guider needs.
+                PreciseWait.Sleep(PollInterval);
             }
         }
+
+        /// <summary>How long <see cref="GetVideoData"/> waits between two asks of <c>GetQHYCCDLiveFrame</c>.</summary>
+        private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(1);
 
         /// <summary>
         /// Switches the handle between single-frame (0) and live (1) mode, which on QHY is a re-init, and sets again what the
